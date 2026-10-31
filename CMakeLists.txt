@@ -14,12 +14,17 @@ find_package(Threads REQUIRED)
 add_library(edgegate_core
     src/util.cpp
     src/log.cpp
+    src/http.cpp
 )
 target_include_directories(edgegate_core PUBLIC include)
 target_compile_options(edgegate_core PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(edgegate_core PUBLIC Threads::Threads)
 
 include(CTest)
+add_executable(http_test tests/http_test.cpp)
+target_link_libraries(http_test PRIVATE edgegate_core)
+target_compile_options(http_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME http_test COMMAND http_test)
 if(BUILD_TESTING)
     add_executable(buffer_test tests/buffer_test.cpp)
     target_link_libraries(buffer_test PRIVATE edgegate_core)
