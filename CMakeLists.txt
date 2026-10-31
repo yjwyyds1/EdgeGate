@@ -19,16 +19,24 @@ add_library(edgegate_core
     src/metrics.cpp
     src/backend.cpp
     src/retry.cpp
+    src/admin.cpp
+    src/proxy.cpp
 )
 target_include_directories(edgegate_core PUBLIC include)
 target_compile_options(edgegate_core PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(edgegate_core PUBLIC Threads::Threads)
 
 include(CTest)
+
 add_executable(http_test tests/http_test.cpp)
 target_link_libraries(http_test PRIVATE edgegate_core)
 target_compile_options(http_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME http_test COMMAND http_test)
+
+add_executable(edgegate apps/edgegate.cpp)
+target_link_libraries(edgegate PRIVATE edgegate_core)
+target_compile_options(edgegate PRIVATE -Wall -Wextra -Wpedantic)
+
 if(BUILD_TESTING)
     add_executable(buffer_test tests/buffer_test.cpp)
     target_link_libraries(buffer_test PRIVATE edgegate_core)
@@ -54,4 +62,5 @@ if(BUILD_TESTING)
     target_link_libraries(retry_test PRIVATE edgegate_core)
     target_compile_options(retry_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME retry_test COMMAND retry_test)
+    
 endif()
