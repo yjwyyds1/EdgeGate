@@ -15,6 +15,7 @@ add_library(edgegate_core
     src/util.cpp
     src/log.cpp
     src/http.cpp
+    src/config.cpp
 )
 target_include_directories(edgegate_core PUBLIC include)
 target_compile_options(edgegate_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -30,4 +31,9 @@ if(BUILD_TESTING)
     target_link_libraries(buffer_test PRIVATE edgegate_core)
     target_compile_options(buffer_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME buffer_test COMMAND buffer_test)
+    
+    add_executable(config_test tests/config_test.cpp)
+    target_link_libraries(config_test PRIVATE edgegate_core)
+    target_compile_options(config_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME config_test COMMAND config_test)
 endif()
