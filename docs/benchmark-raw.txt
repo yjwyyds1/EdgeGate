@@ -1,0 +1,66 @@
+== environment ==
+Linux 6.18.33.1-microsoft-standard-WSL2 x86_64
+g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+cmake version 4.2.3
+4
+
+== small JSON (GET /api/info), 3 rounds, 100000 requests total ==
+direct conns=1  round=1 requests=100000 errors=0 non_2xx=0 connections=1 elapsed_s=4.250 qps=23528.839 bytes=12888896 p50_ms=0.036 p90_ms=0.055 p95_ms=0.071 p99_ms=0.124 max_ms=4.134
+direct conns=1  round=2 requests=100000 errors=0 non_2xx=0 connections=1 elapsed_s=3.930 qps=25445.055 bytes=13000000 p50_ms=0.035 p90_ms=0.049 p95_ms=0.064 p99_ms=0.115 max_ms=0.422
+direct conns=1  round=3 requests=100000 errors=0 non_2xx=0 connections=1 elapsed_s=4.077 qps=24524.972 bytes=13081835 p50_ms=0.035 p90_ms=0.052 p95_ms=0.068 p99_ms=0.119 max_ms=1.386
+proxy  conns=1  round=1 requests=100000 errors=0 non_2xx=0 connections=1 elapsed_s=11.577 qps=8637.759 bytes=13011140 p50_ms=0.089 p90_ms=0.180 p95_ms=0.248 p99_ms=0.416 max_ms=7.311
+proxy  conns=1  round=2 requests=100000 errors=0 non_2xx=0 connections=1 elapsed_s=10.742 qps=9308.996 bytes=13033333 p50_ms=0.085 p90_ms=0.160 p95_ms=0.212 p99_ms=0.361 max_ms=3.179
+proxy  conns=1  round=3 requests=100000 errors=0 non_2xx=0 connections=1 elapsed_s=10.948 qps=9134.176 bytes=13033353 p50_ms=0.086 p90_ms=0.163 p95_ms=0.212 p99_ms=0.374 max_ms=3.149
+direct conns=8  round=1 requests=100000 errors=0 non_2xx=0 connections=8 elapsed_s=0.240 qps=416292.993 bytes=13100000 p50_ms=0.015 p90_ms=0.025 p95_ms=0.029 p99_ms=0.044 max_ms=0.317
+direct conns=8  round=2 requests=100000 errors=0 non_2xx=0 connections=8 elapsed_s=0.261 qps=383865.957 bytes=13100000 p50_ms=0.015 p90_ms=0.029 p95_ms=0.036 p99_ms=0.054 max_ms=0.536
+direct conns=8  round=3 requests=100000 errors=0 non_2xx=0 connections=8 elapsed_s=0.318 qps=314321.248 bytes=13100000 p50_ms=0.017 p90_ms=0.031 p95_ms=0.038 p99_ms=0.057 max_ms=0.431
+proxy  conns=8  round=1 requests=100000 errors=0 non_2xx=0 connections=8 elapsed_s=3.861 qps=25900.758 bytes=13100000 p50_ms=0.284 p90_ms=0.396 p95_ms=0.452 p99_ms=0.612 max_ms=5.743
+proxy  conns=8  round=2 requests=100000 errors=0 non_2xx=0 connections=8 elapsed_s=3.888 qps=25719.333 bytes=13100000 p50_ms=0.277 p90_ms=0.395 p95_ms=0.461 p99_ms=0.843 max_ms=6.369
+proxy  conns=8  round=3 requests=100000 errors=0 non_2xx=0 connections=8 elapsed_s=3.765 qps=26560.449 bytes=13100000 p50_ms=0.273 p90_ms=0.383 p95_ms=0.444 p99_ms=0.689 max_ms=5.886
+direct conns=32 round=1 requests=100000 errors=0 non_2xx=0 connections=32 elapsed_s=0.276 qps=362033.077 bytes=13100000 p50_ms=0.064 p90_ms=0.107 p95_ms=0.127 p99_ms=0.219 max_ms=5.525
+direct conns=32 round=2 requests=100000 errors=0 non_2xx=0 connections=32 elapsed_s=0.292 qps=342836.228 bytes=13101459 p50_ms=0.069 p90_ms=0.117 p95_ms=0.140 p99_ms=0.198 max_ms=1.967
+direct conns=32 round=3 requests=100000 errors=0 non_2xx=0 connections=32 elapsed_s=0.280 qps=357630.553 bytes=13200000 p50_ms=0.075 p90_ms=0.139 p95_ms=0.164 p99_ms=0.230 max_ms=2.680
+proxy  conns=32 round=1 requests=100000 errors=0 non_2xx=0 connections=32 elapsed_s=3.541 qps=28238.115 bytes=13131540 p50_ms=1.024 p90_ms=1.590 p95_ms=1.965 p99_ms=3.830 max_ms=13.225
+proxy  conns=32 round=2 requests=100000 errors=0 non_2xx=0 connections=32 elapsed_s=3.544 qps=28217.107 bytes=13132283 p50_ms=1.005 p90_ms=1.534 p95_ms=1.861 p99_ms=3.705 max_ms=7.178
+proxy  conns=32 round=3 requests=100000 errors=0 non_2xx=0 connections=32 elapsed_s=3.379 qps=29590.253 bytes=13133093 p50_ms=0.976 p90_ms=1.404 p95_ms=1.595 p99_ms=3.368 max_ms=7.841
+
+== 64 MiB download, 3 requests, 1 connection ==
+direct round=1 requests=3 errors=0 non_2xx=0 connections=1 elapsed_s=0.095 qps=31.579 bytes=201326592 p50_ms=20.512 p90_ms=55.225 p95_ms=55.225 p99_ms=55.225 max_ms=55.225
+direct round=2 requests=3 errors=0 non_2xx=0 connections=1 elapsed_s=0.062 qps=48.291 bytes=201326592 p50_ms=21.033 p90_ms=22.647 p95_ms=22.647 p99_ms=22.647 max_ms=22.647
+direct round=3 requests=3 errors=0 non_2xx=0 connections=1 elapsed_s=0.064 qps=46.883 bytes=201326592 p50_ms=20.768 p90_ms=25.280 p95_ms=25.280 p99_ms=25.280 max_ms=25.280
+proxy  round=1 requests=3 errors=0 non_2xx=0 connections=1 elapsed_s=0.066 qps=45.419 bytes=201326592 p50_ms=22.185 p90_ms=22.243 p95_ms=22.243 p99_ms=22.243 max_ms=22.243
+proxy  round=2 requests=3 errors=0 non_2xx=0 connections=1 elapsed_s=0.057 qps=52.296 bytes=201326592 p50_ms=19.058 p90_ms=21.088 p95_ms=21.088 p99_ms=21.088 max_ms=21.088
+proxy  round=3 requests=3 errors=0 non_2xx=0 connections=1 elapsed_s=0.057 qps=52.951 bytes=201326592 p50_ms=17.810 p90_ms=20.707 p95_ms=20.707 p99_ms=20.707 max_ms=20.707
+
+== admin metrics snapshot ==
+# TYPE edgegate_requests_total counter
+edgegate_requests_total 900009
+# TYPE edgegate_responses_total counter
+edgegate_responses_total 900009
+# TYPE edgegate_buffered_bytes gauge
+edgegate_buffered_bytes 0
+# TYPE edgegate_errors_total counter
+edgegate_errors_total{reason="parse"} 0
+edgegate_errors_total{reason="connect"} 0
+edgegate_errors_total{reason="read"} 0
+edgegate_errors_total{reason="write"} 0
+edgegate_errors_total{reason="timeout"} 0
+edgegate_errors_total{reason="no_backend"} 0
+edgegate_errors_total{reason="body_too_large"} 0
+edgegate_errors_total{reason="upstream_eof"} 0
+# TYPE edgegate_upstream_read_paused_total counter
+edgegate_upstream_read_paused_total 2296
+# TYPE edgegate_backend_requests_total counter
+edgegate_backend_requests_total{backend="bench-a"} 298369
+edgegate_backend_requests_total{backend="bench-b"} 299939
+edgegate_backend_requests_total{backend="bench-c"} 301701
+# TYPE edgegate_backend_latency_ms gauge
+edgegate_backend_latency_ms{backend="bench-a",quantile="0.5"} 1
+edgegate_backend_latency_ms{backend="bench-a",quantile="0.95"} 1
+edgegate_backend_latency_ms{backend="bench-a",quantile="0.99"} 2
+edgegate_backend_latency_ms{backend="bench-b",quantile="0.5"} 1
+edgegate_backend_latency_ms{backend="bench-b",quantile="0.95"} 1
+edgegate_backend_latency_ms{backend="bench-b",quantile="0.99"} 1
+edgegate_backend_latency_ms{backend="bench-c",quantile="0.5"} 1
+edgegate_backend_latency_ms{backend="bench-c",quantile="0.95"} 1
+edgegate_backend_latency_ms{backend="bench-c",quantile="0.99"} 1
