@@ -16,6 +16,9 @@ add_library(edgegate_core
     src/log.cpp
     src/http.cpp
     src/config.cpp
+    src/metrics.cpp
+    src/backend.cpp
+    src/retry.cpp
 )
 target_include_directories(edgegate_core PUBLIC include)
 target_compile_options(edgegate_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -36,4 +39,19 @@ if(BUILD_TESTING)
     target_link_libraries(config_test PRIVATE edgegate_core)
     target_compile_options(config_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME config_test COMMAND config_test)
+
+    add_executable(metrics_test tests/metrics_test.cpp)
+    target_link_libraries(metrics_test PRIVATE edgegate_core)
+    target_compile_options(metrics_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME metrics_test COMMAND metrics_test)
+
+    add_executable(balancer_test tests/balancer_test.cpp)
+    target_link_libraries(balancer_test PRIVATE edgegate_core)
+    target_compile_options(balancer_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME balancer_test COMMAND balancer_test)
+
+    add_executable(retry_test tests/retry_test.cpp)
+    target_link_libraries(retry_test PRIVATE edgegate_core)
+    target_compile_options(retry_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME retry_test COMMAND retry_test)
 endif()
