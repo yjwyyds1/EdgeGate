@@ -78,4 +78,11 @@ if(BUILD_TESTING)
     target_compile_options(retry_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME retry_test COMMAND retry_test)
     
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME integration_test
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration_test.py
+                         --binary-dir ${CMAKE_CURRENT_BINARY_DIR})
+        set_tests_properties(integration_test PROPERTIES TIMEOUT 300)
+    endif()
 endif()
