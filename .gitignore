@@ -1,0 +1,8 @@
+build/
+build-*/
+build-*/*
+*.o
+*.a
+*.exe
+compile_commands.json
+.cache/
