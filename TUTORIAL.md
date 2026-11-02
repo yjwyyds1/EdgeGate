@@ -1,10 +1,10 @@
-# EdgeGate 实战教程：从零构建 C++20 HTTP/1.1 反向代理
+# EdgeGate 实战教程：从零构建 C++20 HTTP/1.1 + HTTP/2 反向代理
 
 > 面向想投递 Linux 网络、后端基础设施、C++ 服务端岗位的读者。假设你会 C++ 基础（类、RAII、STL、CMake），但没写过代理。
 >
-> 建议节奏：**4–6 周，每天 2–4 小时**。原则：**先自己想、自己写，卡住再看参考实现**。直接抄完代码等于什么都没学到。
+> 建议节奏：**5–7 周，每天 2–4 小时**。原则：**先自己想、自己写，卡住再看参考实现**。直接抄完代码等于什么都没学到。
 >
-> 当前源码对应 v1.0，README 描述的是已实现能力；本教程既讲“怎么复刻”，也讲“为什么这样设计”和“面试怎么讲”。
+> 当前源码对应 v1.1，包含 HTTP/1.1、TLS 终止和 HTTP/2 前端（h2 → h1）。README 描述的是已实现能力；本教程既讲“怎么复刻”，也讲“为什么这样设计”和“面试怎么讲”。
 
 ---
 
@@ -31,7 +31,14 @@ cmake --version | head -1
 nproc
 ```
 
-需要 GCC 13+、CMake 3.22+。演示后端需要 `libcrypto.so.3`（Ubuntu 默认已有）；若标准开发环境缺少头文件，可 `sudo apt install libssl-dev`，但本项目通过手写 ABI 声明只依赖运行库。
+需要 GCC 13+、CMake 3.22+。TLS 需要 OpenSSL 开发包，HTTP/2 需要 nghttp2：
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake ninja-build libssl-dev libnghttp2-dev curl
+```
+
+没有 `libnghttp2-dev` 时 TLS/HTTP1.1 仍可构建，但 ALPN 只提供 `http/1.1`，HTTP/2 场景会被跳过。
 
 ### B. 复制到 WSL 自己的文件系统
 
@@ -47,7 +54,7 @@ cmake --build build-wsl --parallel
 ctest --test-dir build-wsl --output-on-failure
 ```
 
-预期：`7/7 tests passed`（6 个单元测试 + 1 个集成测试）。如果显示 `No tests were found`，先确认 `pwd`、`-DBUILD_TESTING=ON` 和 CMake 配置成功。
+预期 `7/7 tests passed`（6 个单元测试 + 集成测试）；集成测试内部有 26 个场景（HTTP/1.1 + TLS + HTTP/2）。如果显示 `No tests were found`，先确认 `pwd`、`-DBUILD_TESTING=ON` 和 CMake 配置成功。
 
 ### C. 手工跑通三个真实场景
 
@@ -73,6 +80,28 @@ curl -s http://127.0.0.1:9900/api/status | head -c 300
 ```
 
 应看到 `Via: 1.1 edgegate`、`X-EdgeGate-Upstream`、`X-EdgeGate-Request-Id`，重复请求会在 app-a/b/c 之间分布。
+
+TLS 与 HTTP/2（先停掉上面的明文代理，因为示例配置同样监听 8080/9900）：
+
+```bash
+bash scripts/gen_test_cert.sh certs
+./build-wsl/edgegate --config config/edgegate-tls.conf
+```
+
+另开终端：
+
+```bash
+export no_proxy='*' NO_PROXY='*'
+curl -k --http1.1 -o /dev/null -w '%{http_version}\n' https://127.0.0.1:8443/api/info
+# 1.1
+curl -k --http2 -o /dev/null -w '%{http_version}\n' https://127.0.0.1:8443/api/info
+# 2
+curl -k --http2 --parallel \
+  -o /tmp/a -o /tmp/b \
+  https://127.0.0.1:8443/api/delay?ms=400 https://127.0.0.1:8443/api/info
+```
+
+如果 curl 报 `via 10.255.255.254`，是 WSL 把 `http_proxy` 也用于 127.0.0.1；`no_proxy=*` 可解决。
 
 ### D. 自己复刻的目录
 
@@ -599,22 +628,310 @@ Python 标准库足够，不依赖 curl/ab/wrk。
 
 ---
 
-## 第 10 章 简历写法与面试准备
+## 第 10 章 TLS 终止：非阻塞握手与 ALPN
 
-### 10.1 简历条目（只写已实现且能解释的）
+> 这一章对应 v1.1 的第一块新增能力。目标不是“支持 HTTPS”四个字，而是能解释清楚非阻塞 TLS 如何与 epoll 配合。
 
-> **EdgeGate｜C++20 HTTP/1.1 反向代理与负载均衡器**
+### 10.1 先想清楚：TLS 加在哪一层
+
+EdgeGate 的选择：
+
+- TLS **只作用于客户端侧**：浏览器/curl → EdgeGate 是 TLS；
+- EdgeGate → 后端仍是明文 HTTP/1.1；
+- 明文 8080 和 TLS 8443 可以同时监听；
+- TLS 握手完成前不解析 HTTP；
+- ALPN 决定握手后走 h1 还是 h2。
+
+配置：
+
+```ini
+listen = 0.0.0.0:8080
+tls_listen = 0.0.0.0:8443
+tls_cert = certs/cert.pem
+tls_key = certs/key.pem
+tls_min_version = 1.2
+http2 = true
+```
+
+生成测试证书：
+
+```bash
+bash scripts/gen_test_cert.sh certs
+```
+
+### 10.2 非阻塞握手的三个返回值
+
+`SSL_accept` 不是“成功/失败”两个状态：
+
+```text
+SSL_accept
+  ├─ 1                                  -> 握手完成
+  ├─ SSL_ERROR_WANT_READ                -> 等 EPOLLIN
+  ├─ SSL_ERROR_WANT_WRITE               -> 等 EPOLLOUT
+  └─ 其他                                -> 失败/关闭
+```
+
+`TlsConnection` 把它们映射为：
+
+```cpp
+enum class IoStatus { Ok, WantRead, WantWrite, Eof, Error };
+```
+
+`ClientConn` 的握手状态只关注需要的事件：
+
+```text
+WantRead  -> EPOLLIN
+WantWrite -> EPOLLOUT
+Ok        -> 读 ALPN，创建 h1 或 h2 路径
+```
+
+**常见错误**：把 `WANT_WRITE` 当错误关闭；握手会永远完不成。
+
+### 10.3 握手完成前不要解析 HTTP
+
+TLS 记录层不是 HTTP 字节流。`ClientConn` 在 `tls_handshaking=true` 时：
+
+- 只调用 `handle_tls_handshake()`；
+- 不进入 `on_readable()` 的 HTTP 解析；
+- 握手完成后才 `update_events()` 并开始读请求。
+
+### 10.4 ALPN
+
+服务端列表：
+
+```text
+http2=true : \x02h2\x08http/1.1
+http2=false: \x08http/1.1
+```
+
+使用 `SSL_select_next_proto`；没有交集时 `SSL_TLSEXT_ERR_NOACK`，按 h1 处理。
+
+握手后：
+
+```cpp
+SSL_get0_alpn_selected(ssl, &data, &len);
+```
+
+- `"h2"` → `ClientConn::start_h2()`；
+- 其他/空 → 继续 h1。
+
+### 10.5 超时与关闭
+
+- 握手超时：`tls_handshake_timeout_ms`，100 ms tick 检查；
+- 关闭：发一次 `SSL_shutdown`（close_notify），不等待对端，然后延迟关闭 fd；
+- 不等待是为了避免慢客户端拖住关闭；严格双向关闭不在 v1.1 范围。
+
+### 10.6 验收
+
+```bash
+./build/edgegate --config config/edgegate-tls.conf
+curl -k --http1.1 -o /dev/null -w '%{http_version}\n' https://127.0.0.1:8443/api/info
+# 1.1
+curl -k --http2  -o /dev/null -w '%{http_version}\n' https://127.0.0.1:8443/api/info
+# 2
+openssl s_client -connect 127.0.0.1:8443 -alpn h2 -brief </dev/null
+```
+
+### 10.7 检查点
+
+1. `SSL_write` 返回 `WANT_READ` 时应该关注什么事件？为什么？
+2. 握手未完成时收到 EPOLLIN，能直接解析 HTTP 吗？
+3. ALPN 没有交集时应该断开还是回落到 h1？
+4. 为什么 `close_notify` 只发一次、不等待？
+5. 证书/私钥不匹配应该在什么时候发现？
+
+### 10.8 面试追问
+
+- 非阻塞 TLS 与阻塞 TLS 的状态机差异？
+- TLS 1.3 的握手为什么比 1.2 少一个 RTT？
+- ALPN 和 SNI 分别解决什么问题？
+- 会话复用/0-RTT 的风险？
+- 为什么上游 TLS 是另一个问题（证书验证、连接池、SNI）？
+
+---
+
+## 第 11 章 HTTP/2 前端：stream、流控与 h2→h1
+
+> HTTP/2 不是“更快的 HTTP/1.1”，而是完全不同的连接复用模型。v1.1 只做前端 h2，后端仍是 h1。
+
+### 11.1 先理解差异
+
+| 维度 | HTTP/1.1 | HTTP/2 |
+| --- | --- | --- |
+| 并发 | 多连接 / pipelining | 一个连接多 stream |
+| 头部 | 文本 | HPACK 二进制 |
+| 流量控制 | 无（靠 TCP） | 连接 + stream 窗口 |
+| 生命周期 | 连接级 | stream 级 |
+| 协议协商 | 无 | ALPN（TLS） |
+
+EdgeGate 的映射：
+
+```text
+h2 stream 1 ─┐
+h2 stream 3 ─┼─> 每个 H2Stream 一个 HTTP/1.1 上游交换
+h2 stream 5 ─┘
+```
+
+### 11.2 nghttp2 session
+
+创建：
+
+```cpp
+nghttp2_session_callbacks_new(&callbacks);
+nghttp2_session_callbacks_set_on_begin_headers_callback(...);
+nghttp2_session_callbacks_set_on_header_callback(...);
+nghttp2_session_callbacks_set_on_data_chunk_recv_callback(...);
+nghttp2_session_callbacks_set_on_frame_recv_callback(...);
+nghttp2_session_callbacks_set_on_stream_close_callback(...);
+nghttp2_session_server_new2(&session, callbacks, this, nullptr);
+```
+
+提交设置：
+
+```cpp
+nghttp2_settings_entry settings[] = {
+  {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 32},
+  {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1 << 20},
+};
+nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, settings, 2);
+```
+
+I/O：
+
+- `nghttp2_session_mem_recv` 吃 TLS 读到的字节；
+- `nghttp2_session_mem_send` 产生待发帧，写入 `H2Session::out`，再 `SSL_write`；
+- `mem_send` 必须在回调外调用；回调里只改状态，调用 `schedule_flush()` 延迟发送。
+
+### 11.3 stream 生命周期
+
+```text
+HEADERS -> on_begin_headers
+           on_header(:method/:path/:authority/...)
+           on_frame_recv(END_STREAM?)
+                -> on_end_stream -> dispatch
+DATA    -> on_data_chunk_recv -> 追加 body
+           on_frame_recv(END_STREAM)
+                -> on_end_stream -> dispatch
+RST/完成 -> on_stream_close -> 中止上游、提交 trace、延迟回收
+```
+
+`nghttp2_session_set_stream_user_data(session, id, stream)` 让回调能找回 `H2Stream*`。
+
+**不要在 on_stream_close 里直接 delete**：nghttp2 回调栈还可能引用；放入 `erase_queue`，在 `mem_recv`/`mem_send` 返回后 `reap()`。
+
+### 11.4 请求体为什么先缓冲
+
+h2 请求体没有天然长度。要转成 h1，有两条路：
+
+1. 等 END_STREAM，用 Content-Length；
+2. 流式转成 h1 chunked，做 h2 窗口 ↔ 上游写缓冲联动。
+
+v1.1 选 1：
+
+- 请求头/响应头映射简单；
+- 请求体可重放，重试逻辑与 h1 一致；
+- 不需要把 h2 流控窗口更新与上游背压做双向联动。
+
+代价：
+
+- 单流 `http2_max_request_body_bytes`（默认 8 MiB）；
+- 单连接 `http2_max_total_request_body_bytes`（默认 32 MiB）；
+- 超限返回 413。
+
+**这是明确取舍，不是“已经支持流式 h2 上传”。**
+
+### 11.5 响应：data provider 与背压
+
+h2 响应不能一次性生成后 `submit` 完事。使用 data provider：
+
+```cpp
+provider.source.ptr = stream;
+provider.read_callback = &H2Stream::data_read;
+nghttp2_submit_response2(session, id, nva, nvlen, &provider);
+```
+
+回调：
+
+- `pending` 有数据 → 拷贝，返回字节数；
+- `pending` 为空且未完成 → `NGHTTP2_ERR_DEFERRED`；
+- 上游数据到达 → `nghttp2_session_resume_data`；
+- 响应完成且 pending 为空 → `NGHTTP2_DATA_FLAG_EOF`。
+
+背压：
+
+```text
+upstream recv -> pending -> data provider -> H2Session out -> TLS
+pending >= client_buffer_high -> 暂停上游 EPOLLIN
+provider 消费到 low -> 恢复
+```
+
+集成测试用 `curl --http2 --limit-rate 256k` 下载 1 MiB，确认 `upstream_read_paused_total > 0` 且 `buffered_bytes < 2 MiB`。
+
+### 11.6 重试与错误
+
+- h2 请求体已完整缓冲，满足“可重放”；
+- 仍然遵守 h1 规则：非幂等请求写出字节后不重试；已收到响应不重试；
+- 连接失败/响应前断开 → GET/HEAD 可换后端重试；
+- 已提交响应头后上游失败 → `RST_STREAM(INTERNAL_ERROR)`；
+- 未提交响应头 → 502/504 响应；
+- 超时：`upstream_response_timeout_ms` 按 stream 计时。
+
+### 11.7 多路复用怎么验证
+
+不要只看“用了 nghttp2”。用：
+
+```bash
+curl -k --http2 --parallel \
+  -o /tmp/a -o /tmp/b \
+  -w '%{url_effective} %{http_version} %{time_total}\n' \
+  https://127.0.0.1:8443/api/delay?ms=400 \
+  https://127.0.0.1:8443/api/info
+```
+
+同时检查管理端：
+
+```bash
+curl -s http://127.0.0.1:9900/metrics | grep client_connections_total
+```
+
+两个请求都 `http_version=2`，总墙钟约 0.4–0.5 s，且 `client_connections_total` 只增加 1，说明共用一个 TLS 连接、两个 stream。
+
+### 11.8 检查点
+
+1. `on_stream_close` 为什么不能直接 delete stream？
+2. h2 请求体为什么缓冲？上限是多少？超限返回什么？
+3. data provider 返回 `NGHTTP2_ERR_DEFERRED` 后，什么时候恢复？
+4. h2 的多路复用与 h1 keep-alive 有什么本质区别？
+5. h2 已提交响应头后上游断开，为什么不能发 502？
+6. 如何证明两个请求真的在同一个连接上？
+
+### 11.9 面试追问
+
+- HPACK 解决什么问题？动态表的风险？
+- h2 流控窗口与 TCP 窗口的关系？
+- 为什么 h2 需要 GOAWAY？本项目做了吗？
+- h2 请求体流式转发会引入哪些状态？
+- 单线程 h2 session 的瓶颈在哪里？
+- 如何做 h2 上游/端到端 h2？
+
+---
+
+## 第 12 章 简历写法与面试准备
+
+### 12.1 简历条目（只写已实现且能解释的）
+
+> **EdgeGate｜C++20 HTTP/1.1 + HTTP/2 反向代理与负载均衡器**
 >
-> 基于 epoll 实现单线程非阻塞 HTTP/1.1 代理：支持 keep-alive、Content-Length/chunked 双向流式转发、100-continue、HEAD/204/304 与 HTTP/1.0 客户端；实现每后端连接池、round-robin/least-conn、主动/被动健康检查与故障恢复；设计双向缓冲水位和全局预算，慢客户端场景下应用层缓冲稳定在 256 KiB、RSS 约 8 MiB；按 HTTP 方法、已写字节和 body 可重放性实现安全重试，POST 写出后不重发；提供 Prometheus 指标、请求级 trace 和内置管理面板；用 Python 端到端测试覆盖上传/下载哈希、故障转移、重试和背压。
+> 基于 epoll 实现单线程非阻塞代理：HTTP/1.1 支持 keep-alive、CL/chunked 双向流式转发、100-continue、HEAD/204/304 与 HTTP/1.0；实现每后端连接池、round-robin/least-conn、主动/被动健康检查与故障恢复；设计双向缓冲水位和全局预算，慢客户端场景下应用层缓冲稳定在 256 KiB、RSS 约 8 MiB；按方法、已写字节和 body 可重放性实现安全重试，POST 写出后不重发；v1.1 增加 OpenSSL 非阻塞 TLS 终止、ALPN 与 nghttp2 HTTP/2 前端（h2 stream → HTTP/1.1 上游），支持多路复用、流级响应背压与 h2 重试；提供 Prometheus 指标、请求级 trace 和管理面板；Python 端到端测试 26 个场景覆盖 TLS/h2、上传下载哈希、故障转移、重试和背压。
 
 **写法纪律**：
 
-- 数字来自你自己的机器和 `docs/benchmark.md`；
+- 数字来自你自己的机器和 `docs/benchmark.md`；TLS/HTTP2 没有吞吐基准数字，不要编；
 - 不要说“支持百万并发”“生产级”；
-- 不要写 TLS/HTTP2，除非你真的做了；
+- TLS/HTTP2 只写你真正跑通并讲得清的部分：ALPN、非阻塞握手、h2 stream、流控、背压；
 - 每个名词都要能展开 2–3 分钟。
 
-### 10.2 高频追问
+### 12.2 高频追问
 
 **网络/协议**
 
@@ -625,6 +942,10 @@ Python 标准库足够，不依赖 curl/ab/wrk。
 - 请求走私怎么防？
 - HTTP/1.0 和 1.1 的 keep-alive 差异？
 - 100-continue 的意义？
+- 非阻塞 TLS 的 WANT_READ/WANT_WRITE 怎么映射到 epoll？
+- ALPN 的作用？没有交集怎么办？
+- HTTP/2 的 stream、HPACK、流控窗口分别是什么？
+- h2 stream 如何映射到 h1 上游？
 
 **代理/可靠性**
 
@@ -635,6 +956,9 @@ Python 标准库足够，不依赖 curl/ab/wrk。
 - 超时/失败/5xx 的语义区别？
 - 慢客户端怎么防 OOM？
 - 全局预算和单连接水位的关系？
+- h2 请求体为什么缓冲？上限多少？超限怎么办？
+- h2 响应为什么用 data provider，而不是一次性生成？
+- h2 已提交响应头后上游断开怎么处理？
 
 **性能**
 
@@ -646,17 +970,19 @@ Python 标准库足够，不依赖 curl/ab/wrk。
 
 **通用**
 
-- 最难调的 bug 是什么？（准备 1–2 个真实故事，例如“上游 EPOLLOUT 未处理导致请求永远不发出”“chunked 终止帧重复导致下一条响应错位”）
-- 如果重做，哪里会不同？（例如“响应超时应从实际 flush 完成开始计时”“access log 应异步”）
+- 最难调的 bug 是什么？（准备 1–2 个真实故事，例如“上游 EPOLLOUT 未处理导致请求永远不发出”“chunked 终止帧重复导致下一条响应错位”“h2 stream 在回调里被 delete 导致悬垂”）
+- 如果重做，哪里会不同？（例如“响应超时应从实际 flush 完成开始计时”“access log 应异步”“h2 请求体应流式而不是缓冲”）
 
-### 10.3 现场演示
+### 12.3 现场演示
 
 1. 启动 3 个后端 + 代理；
 2. 浏览器打开管理面板；
 3. `curl` 上传/下载并 `sha256sum`；
-4. 杀掉一个后端，展示健康状态变化；
+4. 杀掉一个后端，展示健康状态变化（h1 与 h2 各一次）；
 5. 运行慢客户端脚本，展示 `buffered_bytes` 和暂停次数；
-6. 跑 `eg_loadgen`，解释直连 vs 代理差异。
+6. `curl -k --http2 --parallel` 展示两个 stream 共用一个连接；
+7. `curl -k --http2 --limit-rate 256k` 展示 h2 响应背压；
+8. 跑 `eg_loadgen`，解释直连 vs 代理差异。
 
 ---
 
@@ -692,7 +1018,7 @@ python3 scripts/slow_client.py --port 8080 --admin 9900 --mb 8
 pkill -x edgegate; pkill -x eg_demo
 ```
 
-## 附录 B 4–6 周计划
+## 附录 B 5–7 周计划
 
 | 周 | 内容 | 完成标志 |
 | --- | --- | --- |
@@ -700,8 +1026,9 @@ pkill -x edgegate; pkill -x eg_demo
 | W2 | epoll、客户端/上游状态机、部分读写 | keep-alive、真实 GET/HEAD/204 通过 |
 | W3 | 连接池、LB、健康检查、超时 | 杀后端能摘除/恢复；无连接泄漏 |
 | W4 | 背压、重试、chunked 转换 | 慢客户端缓冲有界；POST 不重试 |
-| W5 | 指标、trace、管理面板、集成测试 | 18 个场景通过 |
-| W6 | 基准、文档、简历/面试 | benchmark + 手工报告 + 能讲清每个决策 |
+| W5 | 指标、trace、管理面板、集成测试 | 26 个场景通过（h1） |
+| W6 | TLS 终止、ALPN、证书、握手超时 | `curl --http1.1` 与 `--http2` 都能协商 |
+| W7 | HTTP/2 session/stream、多路复用、h2 背压 | h2 GET/POST/上传/下载/413/504/重试通过 |
 
 ## 附录 C 配置速查
 
@@ -711,8 +1038,10 @@ pkill -x edgegate; pkill -x eg_demo
 - 四个水位 + `max_total_buffered_bytes`；
 - `max_connections_per_backend` / `max_idle_connections_per_backend`；
 - 三类超时：客户端、上游、总请求；
-- 健康检查间隔/阈值/冷却。
+- 健康检查间隔/阈值/冷却；
+- TLS：`tls_listen`、`tls_cert`、`tls_key`、`tls_min_version`、`tls_handshake_timeout_ms`；
+- HTTP/2：`http2`、`http2_max_request_body_bytes`、`http2_max_total_request_body_bytes`、`http2_max_concurrent_streams`。
 
 ---
 
-> 最后：这个项目最容易“看起来做完了”的地方是 happy path；真正拉开差距的是慢客户端、半截读写、连接复用和重试边界。每写一个功能，先问“它在什么情况下会坏”，再写测试。
+> 最后：这个项目最容易“看起来做完了”的地方是 happy path；真正拉开差距的是慢客户端、半截读写、连接复用和重试边界。TLS/HTTP2 又各引入一套状态机：TLS 的 `WANT_READ/WANT_WRITE`，HTTP/2 的 stream 生命周期与流控。每写一个功能，先问“它在什么情况下会坏”，再写测试。

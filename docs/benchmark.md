@@ -104,4 +104,4 @@ backpressure: buffered<=262144B pauses=15 rss=5652KiB
 2. 直连与代理的后端数量不同（1 vs 3），不是严格的单变量对照。
 3. `/api/info` 响应很小，主要测请求路径开销；大文件测试主要测流式吞吐，二者不能互相替代。
 4. `eg_loadgen` 每个连接串行请求，没有测 HTTP pipelining；代理本身支持延迟处理的管线化，但未做吞吐基准。
-5. 没有测 TLS/HTTP2，因为 v1 不支持。
+5. TLS 与 HTTP/2 只做了功能、协议正确性和背压验证（见 [manual-test-report.md](manual-test-report.md)），**没有吞吐基准**：TLS 增加握手与记录层开销，h2 减少连接数但单核仍要处理 HPACK、流控和 data provider。不要在没有自己测量的情况下引用 TLS/h2 性能数字。

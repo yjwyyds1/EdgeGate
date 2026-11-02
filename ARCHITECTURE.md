@@ -1,6 +1,6 @@
 # EdgeGate 架构与源码导览
 
-> 本文描述 `include/`、`src/`、`apps/`、`tests/` 中**当前可构建的源码**，供阅读、复刻和核对行为使用。项目定位是单机、单事件循环的 HTTP/1.1 教学代理，不是生产级 Nginx 替代品。
+> 本文描述 `include/`、`src/`、`apps/`、`tests/` 中**当前可构建的源码**，供阅读、复刻和核对行为使用。项目定位是单机、单事件循环的 HTTP/1.1 + HTTP/2 教学代理，可选 TLS 终止，不是生产级 Nginx 替代品。
 
 ## 相关源码
 
@@ -8,6 +8,8 @@
 | --- | --- |
 | [`include/edgegate/buffer.hpp`](include/edgegate/buffer.hpp) | 连续可读区间 + 尾部可写空间；读指针不搬移，空间不足时压缩/扩容 |
 | [`include/edgegate/http.hpp`](include/edgegate/http.hpp)、[`src/http.cpp`](src/http.cpp) | 请求/响应头解析、chunked 解码、逐跳头过滤、序列化、错误响应 |
+| [`include/edgegate/tls.hpp`](include/edgegate/tls.hpp)、[`src/tls.cpp`](src/tls.cpp) | OpenSSL 上下文、证书、ALPN、非阻塞握手、`SSL_read/SSL_write` |
+| [`src/h2_impl.inc`](src/h2_impl.inc) | nghttp2 HTTP/2 session、stream、请求/响应交换、流级背压 |
 | [`include/edgegate/config.hpp`](include/edgegate/config.hpp)、[`src/config.cpp`](src/config.cpp) | INI 风格配置、严格校验、尺寸/超时/水位 |
 | [`include/edgegate/metrics.hpp`](include/edgegate/metrics.hpp)、[`src/metrics.cpp`](src/metrics.cpp) | 原子计数、Gauge、固定桶直方图、Prometheus 文本 |
 | [`include/edgegate/backend.hpp`](include/edgegate/backend.hpp)、[`src/backend.cpp`](src/backend.cpp) | 后端健康状态机、冷却、快照、round-robin/least-conn |
@@ -20,13 +22,18 @@
 | [`apps/edgegate.cpp`](apps/edgegate.cpp) | 命令行入口、配置校验、启动 |
 | [`apps/demo_backend.cpp`](apps/demo_backend.cpp) | 真实文件/API 演示后端 |
 | [`apps/eg_loadgen.cpp`](apps/eg_loadgen.cpp) | keep-alive 压测器 |
-| [`tests/`](tests/) | 6 个单元测试 + 18 个端到端场景 |
+| [`tests/`](tests/) | 6 个单元测试 + 26 个端到端场景（HTTP/1.1、TLS、HTTP/2） |
 
 ## 1. 目的与交付边界
 
-EdgeGate 接收 HTTP/1.0/1.1 客户端请求，按 `round_robin` 或 `least_conn` 选择一个后端，使用非阻塞 socket 转发请求头和请求体，再把响应头和响应体流式转发给客户端。它维护每后端连接池、主动/被动健康检查、超时、限流式的缓冲水位和可观测性。
+EdgeGate 接收 HTTP/1.0/1.1 客户端请求，也可在 TLS 端口上通过 ALPN 协商 HTTP/1.1 或 HTTP/2。它按 `round_robin` 或 `least_conn` 选择一个后端，使用非阻塞 socket 转发请求头和请求体，再把响应头和响应体流式转发给客户端。它维护每后端连接池、主动/被动健康检查、超时、限流式的缓冲水位和可观测性。
 
-**不包含**：TLS、HTTP/2、WebSocket/CONNECT、多 worker、配置热加载、管理端认证、缓存、动态服务发现。协议升级请求会得到 501，而不是被“透明转发”。
+- HTTP/1.1：连接级状态机，流式请求/响应；
+- TLS：OpenSSL 非阻塞握手，TLS 1.2/1.3，ALPN；
+- HTTP/2：nghttp2 server session，一个连接多 stream，每 stream 映射一个 HTTP/1.1 上游交换；
+- 上游始终是明文 HTTP/1.1。
+
+**不包含**：HTTP/3、h2c、HTTP/2 上游、server push、trailer 转发、客户端证书/mTLS、SNI 多证书、WebSocket/CONNECT、多 worker、配置热加载、管理端认证、缓存、动态服务发现。
 
 ## 2. 核心组件与数据流
 
@@ -34,7 +41,9 @@ EdgeGate 接收 HTTP/1.0/1.1 客户端请求，按 `round_robin` 或 `least_conn
 flowchart LR
     subgraph EdgeGate process
         EL[EventLoop: epoll]
+        TLS[TlsConnection]
         CC[ClientConn state machine]
+        H2[H2Session / H2Stream]
         UC[UpstreamConn state machine]
         PP[RequestHeadParser / ResponseHeadParser]
         CD[ChunkedDecoder]
@@ -44,18 +53,25 @@ flowchart LR
         M[Metrics + trace ring]
         AD[AdminServer]
     end
-    C[Client] --> CC
+    C[Client] --> TLS
+    TLS --> CC
+    CC --> H2
     CC --> PP
     CC --> CD
+    H2 --> PP
     CC --> BAL
+    H2 --> BAL
     BAL --> POOL
     CC <--> UC
+    H2 <--> UC
     UC --> CD
     HC --> Backends
     CC --> M
+    H2 --> M
     UC --> M
     AD --> M
     EL --> CC
+    EL --> H2
     EL --> UC
     EL --> AD
     EL --> HC
@@ -64,9 +80,12 @@ flowchart LR
 | 层 | 拥有什么状态 | 对外提供什么 |
 | --- | --- | --- |
 | `EventLoop` | epoll fd、fd→handler 映射、延迟关闭列表 | `add/mod/remove/close_later/run_once` |
-| `ClientConn` | 客户端 fd、in/out Buffer、请求解析器、当前请求上下文、trace | 读请求、转发、重试、错误响应、超时 |
-| `UpstreamConn` | 上游 fd、in/out Buffer、连接/空闲标志 | 非阻塞 connect、部分写、事件转发给 owner |
-| `Backend` | 健康/冷去/draining、计数、延迟直方图 | `selectable`、`record_success/failure`、snapshot |
+| `TlsConnection` | SSL、握手状态、ALPN | 非阻塞握手、`SSL_read/SSL_write`、`close_notify` |
+| `ClientConn` | 客户端 fd、TLS、in/out Buffer、h1 请求上下文、trace | h1 读请求/转发/重试；h2 模式委托 H2Session |
+| `H2Session` | nghttp2 session、stream map、TLS 输出缓冲 | 解析 SETTINGS/HEADERS/DATA、管理 stream 生命周期 |
+| `H2Stream` | 单 stream 的方法/路径/body、响应解析、上游 owner 回调 | 选择后端、构造 h1 请求、提交 h2 响应、流级背压 |
+| `UpstreamConn` | 上游 fd、in/out Buffer、连接/空闲标志 | 非阻塞 connect、部分写、事件转发给 `UpstreamOwner` |
+| `Backend` | 健康/冷却/draining、计数、延迟直方图 | `selectable`、`record_success/failure`、snapshot |
 | `Balancer` | 轮询游标 | 选择下一个可用后端（可排除） |
 | `ProxyServer::Impl` | 所有连接、池、指标、trace ring、管理端 | 启动/停止、状态 JSON、Prometheus |
 
@@ -171,6 +190,98 @@ SizeLine -> Data -> DataCrlf -> SizeLine
 
 代理对 HTTP/1.1 客户端会把 chunked/close-delimited 响应重新分帧为 chunked，因此客户端连接仍可 keep-alive；HTTP/1.0 客户端则去分块并用关闭连接定界。
 
+### 6.4 TLS 与 ALPN
+
+`TlsContext` 是进程级 OpenSSL 上下文：
+
+- `SSL_CTX_new(TLS_server_method())`；
+- `SSL_CTX_set_min_proto_version`：只允许 TLS 1.2 或 1.3；
+- 加载证书链和私钥并校验匹配；
+- `SSL_CTX_set_alpn_select_cb`：`http2=true` 时服务端列表是 `h2,http/1.1`，否则只有 `http/1.1`；
+- `SSL_OP_NO_COMPRESSION`、`SSL_MODE_ENABLE_PARTIAL_WRITE`、`SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER`。
+
+`TlsConnection` 是每客户端连接：
+
+- `SSL_new` + `SSL_set_fd` + `SSL_set_accept_state`；
+- `handshake()` 返回 `Ok/WantRead/WantWrite/Error`；
+- `read()/write()` 把 `SSL_ERROR_WANT_READ/WANT_WRITE` 映射为 `IoStatus`；
+- `alpn()` 返回协商结果；
+- `shutdown()` 只发一次 `close_notify`，不等待对端。
+
+`ClientConn` 在握手期间：
+
+- 只关注握手需要的方向：`WantRead → EPOLLIN`，`WantWrite → EPOLLOUT`；
+- 握手完成前不解析 HTTP；
+- 握手超时用 `tls_handshake_timeout_ms`；
+- 握手成功后根据 ALPN 选择 h1 或 h2。
+
+TLS 只作用于客户端侧；上游始终是明文 HTTP/1.1。v1.1 不支持客户端证书、SNI 多证书、OCSP stapling 和证书热加载。
+
+### 6.5 HTTP/2 前端
+
+ALPN 选中 `h2` 后，`ClientConn::start_h2()` 创建 `H2Session`：
+
+```text
+H2Session
+  ├── nghttp2_session (server)
+  ├── streams: stream_id -> H2Stream
+  ├── out Buffer (TLS 写缓冲)
+  └── total_body 预算
+
+H2Stream (每 stream 一个)
+  ├── :method/:path/:authority + headers
+  ├── body（缓冲，受上限）
+  ├── Backend* / UpstreamConn*
+  ├── ResponseHeadParser / ChunkedDecoder
+  ├── pending response buffer + data provider
+  └── RequestTrace
+```
+
+**连接建立**：
+
+- `nghttp2_session_server_new2`，注册 begin_headers/header/data_chunk/frame_recv/stream_close 回调；
+- 提交 SETTINGS：`MAX_CONCURRENT_STREAMS=http2_max_concurrent_streams`、`INITIAL_WINDOW_SIZE=1 MiB`；
+- `nghttp2_session_mem_send` 产生的帧写入 `H2Session::out`，再通过 `ClientConn::client_write`（TLS）发出。
+
+**stream 生命周期**：
+
+1. `on_begin_headers` 创建 `H2Stream`，设置 nghttp2 stream user data；
+2. `on_header` 收集 pseudo headers 和普通 headers，丢弃 h2 禁止的逐跳头；
+3. `on_data_chunk_recv` 把 body 追加到 stream；超过单流/单连接上限标记 `too_large`；
+4. `on_frame_recv` 收到 END_STREAM 后校验并 `dispatch()`；
+5. `on_stream_close` 中止上游、提交 trace、加入回收队列；`H2Session::reap` 在回调外删除对象。
+
+**请求映射**：
+
+- h2 body 已完整缓冲，因此向上游发 `Content-Length`（不是 chunked）；
+- 构造 `RequestHead`：method、path、authority、headers、content_length；
+- 通过 `UpstreamOwner` 接口复用 `Impl::acquire_upstream`/连接池/健康检查；
+- 非幂等请求写出字节后不重试；GET/HEAD 在响应前可重试；body 已完整缓冲所以可重放。
+
+**响应**：
+
+- `ResponseHeadParser` 解析上游 h1 响应；
+- 响应头过滤后通过 `nghttp2_submit_response2` 提交；
+- 无 body（HEAD/204/304）时 data provider 为空，nghttp2 直接 END_STREAM；
+- 有 body 时注册 `nghttp2_data_provider2`，从 `pending` 拷贝数据；`pending` 为空且未完成时返回 `NGHTTP2_ERR_DEFERRED`，上游数据到达后 `nghttp2_session_resume_data`；
+- `pending` 超过 `client_buffer_high` 时暂停上游读，data provider 消费到低水位后恢复；这就是 h2 的响应背压；
+- 响应完成后释放上游连接；h2 流关闭由 nghttp2 在 data provider EOF 后触发。
+
+**h2 请求体限制**：
+
+- 单流 `http2_max_request_body_bytes`（默认 8 MiB）；
+- 单连接 `http2_max_total_request_body_bytes`（默认 32 MiB）；
+- 超限返回 413；这是 v1.1 的明确取舍，不是流式 h2 请求体实现。
+
+**h2 错误**：
+
+- 上游失败且尚未提交响应头 → 502/504 响应；
+- 已提交响应头 → `RST_STREAM(INTERNAL_ERROR)`；
+- 客户端 RST/EOF → 中止上游、提交 trace、关闭连接；
+- 超时：`upstream_response_timeout_ms` 与 `request_timeout_ms` 按 stream 计时。
+
+**h2 边界**：不支持 h2c、HTTP/2 上游、server push、trailer 转发、流优先级；h2 只通过 TLS/ALPN 提供。
+
 ## 7. 连接池
 
 池按 `Backend*` 维护 `std::deque<UpstreamConn*>`：
@@ -249,19 +360,32 @@ body 重放缓冲只保存“已转发的解码后字节”，上限 `retry_body
 
 `CMakeLists.txt`：
 
-- `edgegate_core`：util/log/http/config/metrics/backend/retry/admin/proxy；
+- `edgegate_core`：util/log/tls/http/config/metrics/backend/retry/admin/proxy；`proxy.cpp` 在 `EDGEGATE_HAVE_NGHTTP2` 下包含 `src/h2_impl.inc`；
+- 依赖：OpenSSL（TLS/SHA-256）、Threads；nghttp2 可选，找到则启用 HTTP/2，否则只提供 TLS/HTTP1.1；
 - `edgegate`：主程序；
-- `eg_demo`：演示后端（链接 libcrypto）；
+- `eg_demo`：演示后端；
 - `eg_loadgen`：压测器；
 - CTest：`buffer_test`、`http_test`、`config_test`、`balancer_test`、`retry_test`、`metrics_test`、`integration_test`。
 
-集成测试用 Python 标准库启动真实进程和原始 socket，不依赖 curl/ab；覆盖真实文件上传/下载哈希、chunked、keep-alive、故障转移、重试和慢客户端背压。
+集成测试用 Python 标准库启动真实进程；HTTP/1.1 场景用原始 socket，TLS/HTTP2 场景用 `curl --http1.1`/`curl --http2`（自签名证书 + `-k`）。覆盖文件哈希、chunked、keep-alive、故障转移、重试、慢客户端背压、TLS、ALPN h2、多路复用、h2 413/504 和 h2 重试。
+
+构建 HTTP/2 需要：
+
+```bash
+sudo apt install -y libssl-dev libnghttp2-dev
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+没有 nghttp2 时 CMake 会打印警告，TLS/HTTP1.1 仍可构建；集成测试会检测 ALPN 是否协商到 h2，未协商则跳过 h2 场景。
 
 ## 12. 继续实现时的边界
 
 1. **先复现，再重写**：先用集成测试确认当前行为，再按状态机和解析器接口自己实现。
-2. **TLS/HTTP2 不是加一个库就完事**：需要 ALPN、连接生命周期、HTTP/2 流多路复用、流控与 HTTP/1.1 上游的映射。
-3. **多 worker 需要重新设计状态**：后端健康、连接池、指标、trace ring 都要么分片要么共享；不能直接把单线程代码复制到多线程。
-4. **重试需要业务幂等键**：当前只按 HTTP 方法；生产系统常需要 `Idempotency-Key` 或业务去重表。
-5. **背压只覆盖应用层**：内核 socket 缓冲仍可能吸收数据；真实高延迟链路上需要更细的窗口/速率控制。
-6. **管理端安全**：没有认证；如果监听非 loopback，必须先加认证、mTLS 或反向代理保护。
+2. **TLS 与 HTTP/2 是两条状态机**：TLS 的 `WANT_READ/WANT_WRITE` 要映射回 epoll；HTTP/2 的 stream 生命周期、流控和 data provider 与 HTTP/1.1 的连接状态机不同。
+3. **h2 请求体目前是缓冲的**：真正的流式 h2 请求体需要把 h2 DATA 与上游写缓冲、h2 窗口更新联动；当前用上限换实现清晰度。
+4. **多 worker 需要重新设计状态**：后端健康、连接池、指标、trace ring 都要么分片要么共享；不能直接把单线程代码复制到多线程。
+5. **重试需要业务幂等键**：当前只按 HTTP 方法；生产系统常需要 `Idempotency-Key` 或业务去重表。
+6. **背压只覆盖应用层**：内核 socket 缓冲仍可能吸收数据；真实高延迟链路上需要更细的窗口/速率控制。
+7. **管理端安全**：没有认证；如果监听非 loopback，必须先加认证、mTLS 或反向代理保护。

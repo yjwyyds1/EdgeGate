@@ -1,41 +1,46 @@
-# EdgeGate：C++20 HTTP/1.1 反向代理与负载均衡器
+# EdgeGate：C++20 HTTP/1.1 + HTTP/2 反向代理与负载均衡器
 
-EdgeGate 是一个面向 Linux/WSL2 的单线程非阻塞 HTTP/1.1 反向代理：客户端只访问 EdgeGate，它按负载均衡策略选择后端、转发请求与响应，并在后端异常时摘除实例、按安全规则重试。项目重点不是“再写一个 Nginx”，而是把代理里最容易讲清楚、也最容易做错的几件事做完整并给出可复现验证：
+EdgeGate 是一个面向 Linux/WSL2 的单线程非阻塞反向代理：客户端只访问 EdgeGate，它按负载均衡策略选择后端、转发请求与响应，并在后端异常时摘除实例、按安全规则重试。项目重点不是“再写一个 Nginx”，而是把代理里最容易讲清楚、也最容易做错的几件事做完整并给出可复现验证：
 
 - **非阻塞事件循环**：epoll、部分读写、连接生命周期、超时；
-- **有界缓冲与背压**：慢客户端时暂停读取上游，而不是无限堆内存；
+- **TLS 终止**：OpenSSL 非阻塞握手、证书、TLS 1.2/1.3、ALPN；
+- **HTTP/2 前端**：nghttp2 多路复用、流级响应、流控与背压，后端仍是 HTTP/1.1；
+- **有界缓冲与背压**：慢客户端时暂停读取上游（HTTP/1.1 与 HTTP/2 都适用）；
 - **连接池与负载均衡**：keep-alive 复用、每后端连接上限、主动/被动健康检查、恢复；
 - **请求语义**：Content-Length / chunked、`100-continue`、HEAD/204/304、HTTP/1.0、逐跳头过滤；
 - **重试安全边界**：POST/PATCH 写出请求后绝不无条件重发；
 - **可观测性**：Prometheus 指标、JSON 访问日志、请求级 trace、内置管理面板。
 
-当前源码对应 **v1.0**。明确未实现 TLS、HTTP/2、WebSocket/CONNECT、多 worker 和配置热加载；这些是扩展方向，而不是“已经支持但没写文档”。
+当前源码对应 **v1.1**。明确未实现 HTTP/3、h2c、上游 TLS、客户端证书、WebSocket/CONNECT、多 worker 和配置热加载；这些是扩展方向，而不是“已经支持但没写文档”。
 
-> 定位：单机、单事件循环的教学/面试级代理。它接受真实 HTTP/1.1 流量，但不宣称生产级高可用、TLS 卸载或百万并发。
+> 定位：单机、单事件循环的教学/面试级代理。它接受真实 HTTP/1.1/HTTP/2 流量，但不宣称生产级高可用、TLS 集群或百万并发。
 
 ## 当前能力
 
 | 模块 | 状态 |
 | --- | --- |
 | HTTP/1.1 代理 | 请求行/头/体转发，keep-alive，HTTP/1.0 客户端，absolute-form |
-| 请求体 | Content-Length 流式转发、chunked 解码/重新分帧、`Expect: 100-continue` |
-| 响应体 | Content-Length、chunked、close-delimited；HTTP/1.1 客户端自动重新分帧 |
+| TLS 终止 | OpenSSL 非阻塞握手、`tls_cert/tls_key`、TLS 1.2/1.3、ALPN、握手超时 |
+| HTTP/2 前端 | nghttp2 server session、ALPN h2、GET/POST、多路复用、流级响应、流控 |
+| 请求体 | HTTP/1.1：CL/chunked 流式；HTTP/2：缓冲至 `http2_max_request_body_bytes` |
+| 响应体 | CL、chunked、close-delimited；HTTP/1.1 自动重新分帧；HTTP/2 data provider 流式 |
 | 特殊响应 | HEAD、204、304、1xx interim、101（转发后关闭） |
 | 逐跳头 | 过滤 `Connection`、`Keep-Alive`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade` 等 |
-| 客户端信息 | 追加 `X-Forwarded-For`、`X-Forwarded-Proto`、`X-Forwarded-Host`、`Via`、`X-Request-Id` |
+| 客户端信息 | `X-Forwarded-For`、`X-Forwarded-Proto`、`X-Forwarded-Host`、`Via`、`X-Request-Id` |
 | 连接池 | 每后端 idle 队列、最多连接数、idle 超时、复用前 `MSG_PEEK` 探活 |
 | 负载均衡 | `round_robin`、`least_conn`（活跃连接数） |
 | 健康检查 | 主动 HTTP GET、被动连接/读写失败、阈值、冷却、恢复 |
 | 重试 | 幂等请求在未收到响应时可重试；非幂等请求写出字节后禁止重试；body 可重放才重试 |
-| 背压 | 客户端/上游双向水位、暂停/恢复 epoll 读事件、全局缓冲预算 |
-| 超时 | 客户端头/空闲/写停顿、上游连接/响应、总请求、shutdown grace |
+| 背压 | HTTP/1.1 双向水位；HTTP/2 响应 pending 高水位暂停上游读；全局缓冲预算 |
+| 超时 | 客户端头/空闲/写停顿、TLS 握手、上游连接/响应、总请求、shutdown grace |
 | 可观测性 | Prometheus `/metrics`、`/api/status`、`/api/requests`、request trace、HTML 面板、JSONL access log |
 | 运维控制 | 后端 drain/enable（管理端）、优雅停机、SIGHUP 提示未实现热加载 |
 | 演示与验证 | 3 实例演示后端、真实文件上传/下载、登录 API、hash 校验、C++ 压测器、Python 端到端测试 |
 
 **明确未实现**
 
-- TLS（前端或上游）、HTTP/2、HTTP/3；
+- HTTP/3、h2c（明文 HTTP/2）、HTTP/2 上游、server push、HTTP/2 trailer 转发；
+- 上游 TLS/mTLS、客户端证书认证、多证书/SNI 路由、OCSP stapling；
 - WebSocket、CONNECT 隧道、协议升级（返回 501）；
 - 多 worker/多线程事件循环、SO_REUSEPORT；
 - 配置热加载（SIGHUP 只记录日志）；
@@ -91,13 +96,31 @@ curl -sS http://127.0.0.1:8080/uploads/upload.bin -o /tmp/download.bin
 sha256sum /tmp/upload.bin /tmp/download.bin
 ```
 
+启用 TLS 与 HTTP/2（同时保留 8080 明文端口）：
+
+```bash
+bash scripts/gen_test_cert.sh certs
+./build/edgegate --config config/edgegate-tls.conf
+
+# HTTP/1.1 over TLS
+curl -k --http1.1 -i https://127.0.0.1:8443/api/info | head
+# HTTP/2 over TLS（ALPN h2）
+curl -k --http2 -i https://127.0.0.1:8443/api/info | head
+curl -k --http2 -o /dev/null -w 'HTTP version: %{http_version}\n' \
+  https://127.0.0.1:8443/api/info
+```
+
+`curl -k` 仅用于自签名测试证书；生产环境应使用受信任证书，并关闭 `-k`。
+
 内置管理面板：浏览器打开 `http://127.0.0.1:9900/`，可以看到后端健康状态、连接数、请求分布、P95 延迟、缓冲占用和最近请求 trace。
 
 ## 系统架构
 
 ```mermaid
 flowchart LR
-    C[Browser / curl / loadgen] -->|HTTP/1.1| EG[EdgeGate epoll loop]
+    C[Browser / curl / loadgen] -->|HTTP/1.1 :8080| EG[EdgeGate epoll loop]
+    C -->|TLS + ALPN h2/http1.1 :8443| TLS[TLS handshake]
+    TLS --> EG
     EG -->|选择后端| LB[Balancer<br/>round_robin / least_conn]
     LB --> A[app-a]
     LB --> B[app-b]
@@ -110,6 +133,18 @@ flowchart LR
     HEALTH[Health checker] --> A
     HEALTH --> B
     HEALTH --> C
+```
+
+HTTP/2 连接内部：
+
+```mermaid
+flowchart LR
+    H2[HTTP/2 session] --> S1[stream 1]
+    H2 --> S2[stream 2]
+    H2 --> S3[stream 3]
+    S1 --> E1[H2Stream exchange] --> U1[HTTP/1.1 upstream]
+    S2 --> E2[H2Stream exchange] --> U2[HTTP/1.1 upstream]
+    S3 --> E3[H2Stream exchange] --> U3[HTTP/1.1 upstream]
 ```
 
 一次请求的生命周期：
@@ -138,6 +173,8 @@ sequenceDiagram
 - **所有缓冲都有上限**：读之前看水位，写不出去就停读；慢客户端不会把进程内存吃光。
 - **连接是状态机，不是函数调用**：connect、部分写、响应体、客户端断开都通过事件推进。
 - **重试是语义问题，不是网络问题**：只有确认请求没有产生后端可见副作用时才重发。
+- **TLS 是传输层状态机**：握手未完成时只关注握手需要的事件；`SSL_read/SSL_write` 的 `WANT_READ/WANT_WRITE` 映射回 epoll。
+- **HTTP/2 是流级并发**：一个 TLS 连接上多个 stream，每个 stream 映射到一个 HTTP/1.1 上游交换；响应通过 nghttp2 data provider 流式发送。
 - **“可用”要能被观测**：每个后端有健康状态、活跃/空闲连接、延迟分位数和错误计数。
 
 ## 主要模块与用法
@@ -161,6 +198,17 @@ health_timeout_ms = 1000
 health_path = /healthz
 healthy_threshold = 2
 unhealthy_threshold = 3
+
+# TLS / HTTP2（可选）
+tls_listen = 0.0.0.0:8443
+tls_cert = certs/cert.pem
+tls_key = certs/key.pem
+tls_min_version = 1.2
+http2 = true
+http2_max_request_body_bytes = 8M
+http2_max_total_request_body_bytes = 32M
+http2_max_concurrent_streams = 32
+
 access_log = -
 log_level = info
 
@@ -318,6 +366,61 @@ edgegate_request_duration_ms_bucket{le="..."}
 
 输出 `requests/errors/non_2xx/elapsed/qps/bytes/p50/p90/p95/p99/max`。
 
+### 9. TLS 终止与 ALPN
+
+`config/edgegate-tls.conf` 同时保留明文 8080 和 TLS 8443：
+
+```ini
+listen = 0.0.0.0:8080
+tls_listen = 0.0.0.0:8443
+tls_cert = certs/cert.pem
+tls_key = certs/key.pem
+tls_min_version = 1.2
+http2 = true
+```
+
+生成自签名测试证书：
+
+```bash
+bash scripts/gen_test_cert.sh certs
+```
+
+- OpenSSL 非阻塞握手：`SSL_accept` 返回 `WANT_READ/WANT_WRITE` 时映射为 epoll 事件；
+- 握手完成前不解析 HTTP，握手超过 `tls_handshake_timeout_ms` 关闭；
+- ALPN 服务端列表：`h2,http/1.1`（`http2=true`）或 `http/1.1`；
+- 客户端不支持 h2 时自动回落到 HTTP/1.1；
+- 关闭时发一次 `close_notify`，不等待对端，避免慢客户端拖住 shutdown。
+
+```bash
+curl -k --http1.1 https://127.0.0.1:8443/api/info
+curl -k --http2  https://127.0.0.1:8443/api/info
+openssl s_client -connect 127.0.0.1:8443 -alpn h2 -brief </dev/null
+```
+
+### 10. HTTP/2 前端（h2 → h1）
+
+HTTP/2 只在前端启用（ALPN 协商 h2），上游仍使用 HTTP/1.1：
+
+- 每个 h2 stream 映射为一个 `H2Stream` 交换：独立选择后端、独立上游连接、独立 trace；
+- 请求体在内存中缓冲，上限 `http2_max_request_body_bytes`（默认 8 MiB），单连接总上限 `http2_max_total_request_body_bytes`（默认 32 MiB）；超限返回 413；
+- 响应头通过 `nghttp2_submit_response2` 提交，响应体由 data provider 按 h2 流控窗口拉取；pending 高水位时暂停上游读，低水位恢复（与 h1 背压同思路）；
+- 支持 HEAD/204/304、chunked/close-delimited 上游响应、`/api/bulk` 大文件；
+- 非幂等请求写出字节后仍不重试；GET/HEAD 在响应前可以重试；
+- `http2_max_concurrent_streams` 控制并发流数量。
+
+```bash
+curl -k --http2 -o /dev/null -w '%{http_version}\n' https://127.0.0.1:8443/api/info
+# 输出 2
+
+# 多路复用：两个 URL 共用一个 TLS 连接
+curl -k --http2 --parallel \
+  -o /tmp/a -o /tmp/b \
+  https://127.0.0.1:8443/api/delay?ms=400 \
+  https://127.0.0.1:8443/api/info
+```
+
+**v1.1 的边界**：请求体是缓冲而非流式；不支持 h2c、HTTP/2 上游、server push 和 trailer 转发。这些在 [docs/http2.md](docs/http2.md) 中展开。
+
 ## 关键设计决策
 
 ### 单线程 epoll，而不是线程池
@@ -340,6 +443,18 @@ edgegate_request_duration_ms_bucket{le="..."}
 
 管理端没有认证，因此默认只绑定 `127.0.0.1`；如果配置成非 loopback，启动时打印警告。业务端口与管理端口分离，避免 `/metrics` 与真实业务路径冲突。
 
+### TLS 握手与 HTTP 解析解耦
+
+`TlsConnection` 只负责“握手/读/写”和 `WANT_READ/WANT_WRITE`；`ClientConn` 在握手完成前不解析 HTTP。这样 h1 与 h2 都能复用同一套 TLS 传输，ALPN 结果只决定之后走哪条协议路径。
+
+### h2 stream 是独立交换
+
+一个 HTTP/2 连接上每个 stream 都有自己的后端选择、上游连接、响应解析和 trace。`UpstreamOwner` 接口让 h1 的 `ClientConn` 与 h2 的 `H2Stream` 共用连接池、健康检查和重试规则，而不是复制一套网络层。
+
+### h2 请求体先缓冲，响应体流式
+
+v1.1 选择把 h2 请求体缓冲到上限（默认 8 MiB），这样可以用 Content-Length 精确构造 HTTP/1.1 上游请求，避免 h2 流式 body 与 h1 chunked/CL 的复杂映射。响应体则必须流式：通过 nghttp2 data provider + pending 高水位暂停上游读，否则大文件会 OOM。这个取舍在 [docs/http2.md](docs/http2.md) 中明确记录。
+
 ## 测试
 
 ```bash
@@ -350,11 +465,11 @@ ctest --test-dir build --output-on-failure
 | --- | --- |
 | `buffer_test` | append/consume/compaction/扩容/二进制数据 |
 | `http_test` | 请求/响应解析、半包、chunked、错误输入、逐跳头、序列化 |
-| `config_test` | 默认值、section、未知键、重复 backend、非法尺寸/超时 |
+| `config_test` | 默认值、section、未知键、重复 backend、非法尺寸/超时、TLS 必填项 |
 | `balancer_test` | round-robin、least-conn、健康/冷却/draining、排除 |
 | `retry_test` | POST/GET 重试矩阵、attempt 上限、不可重放 body |
 | `metrics_test` | 计数器/直方图/分位数/Prometheus 输出 |
-| `integration_test` | 18 个端到端场景（见下） |
+| `integration_test` | 26 个端到端场景（HTTP/1.1 + TLS + HTTP/2，见下） |
 
 集成测试会启动 3 个真实 `eg_demo` 实例和代理，覆盖：
 
@@ -365,13 +480,15 @@ ctest --test-dir build --output-on-failure
 - 请求走私类错误（CL+TE、超大 header、缺少 Host）；
 - 管理面板/status/metrics/trace；
 - 全部后端 drain → 503；
-- kill 一个后端 → 健康摘除 → 重启恢复；
+- kill 一个后端 → 健康摘除 → 重启恢复（h1 与 h2 都验证）；
 - 4 MiB 慢客户端背压（缓冲上限、暂停次数、RSS）；
 - 响应超时、连接失败；
 - flaky 上游：GET 重试成功、POST 不重试返回 502；
+- TLS HTTP/1.1、ALPN h2、HTTP/2 GET/POST/上传/下载；
+- HTTP/2 多路复用（同一 TLS 连接两个 stream）、chunked/HEAD/204、请求体 413、响应超时 504、慢客户端背压、重试语义；
 - SIGTERM 优雅退出。
 
-实测一次完整运行：`18/18 passed`，CTest 总计约 10 秒。
+实测一次完整运行：`26/26 passed`（HTTP/2 构建），CTest 总计约 15 秒。
 
 ## 性能结果
 
@@ -406,6 +523,8 @@ ctest --test-dir build --output-on-failure
 
 完整原始输出见 [docs/benchmark-raw.txt](docs/benchmark-raw.txt)，方法与复跑见 [docs/benchmark.md](docs/benchmark.md)。
 
+> **TLS/HTTP2 性能说明**：v1.1 只做了功能、协议正确性和背压验证，没有做 TLS/h2 吞吐基准。TLS 增加握手成本；HTTP/2 多路复用减少连接数但单核仍要处理 HPACK、流控和 data provider。不要在没有自己测量的情况下引用 TLS/h2 性能数字。
+
 ## 目录结构
 
 ```text
@@ -415,9 +534,11 @@ EdgeGate/
 ├── ARCHITECTURE.md
 ├── TUTORIAL.md
 ├── config/edgegate.conf
+├── config/edgegate-tls.conf
 ├── include/edgegate/
 │   ├── buffer.hpp          # 连续可读/可写缓冲
 │   ├── http.hpp            # 请求/响应解析、chunked、序列化
+│   ├── tls.hpp             # OpenSSL 上下文/非阻塞 TLS 连接
 │   ├── config.hpp          # 配置结构
 │   ├── metrics.hpp         # Counter/Gauge/Histogram/Prometheus
 │   ├── backend.hpp         # 后端状态、健康、Balancer
@@ -427,37 +548,42 @@ EdgeGate/
 │   ├── admin.hpp           # 管理端口
 │   ├── log.hpp / util.hpp
 ├── src/                    # 对应实现
+│   └── h2_impl.inc         # HTTP/2 session/stream（由 proxy.cpp 包含）
 ├── apps/
 │   ├── edgegate.cpp        # 主程序
 │   ├── demo_backend.cpp    # 真实文件/API 演示后端
 │   └── eg_loadgen.cpp      # keep-alive 压测器
 ├── tests/
 │   ├── *_test.cpp          # 6 个单元测试
-│   └── integration_test.py # 18 个端到端场景
-├── scripts/                # smoke/bench/慢客户端/复现脚本
-└── docs/                   # 设计、基准、手工测试报告
+│   └── integration_test.py # 26 个端到端场景（h1/TLS/h2）
+├── scripts/                # smoke/bench/tls/h2/慢客户端/证书生成
+└── docs/                   # 设计、TLS、HTTP2、基准、手工测试报告
 ```
 
 ## 已知限制
 
 1. **单事件循环**：无法利用多核；8/32 连接下约 2.6–3.0 万 QPS。多 worker 需要共享后端状态、每 worker 计数聚合或独立监听，v1 未做。
-2. **无 TLS/HTTP2**：上游只支持 `http://`；前端只支持 HTTP/1.0/1.1。TLS 与 HTTP/2 是后续阶段。
-3. **协议升级不支持**：WebSocket、CONNECT 返回 501；这不是“透明转发”。
-4. **重试是保守的**：POST/PATCH 写出字节后不重试；需要幂等键/业务确认的更细粒度重试未实现。
-5. **响应超时按“请求已入队”计时**：极端情况下会在上游尚未完全写出 body 时开始计时；生产实现应跟踪实际 flush 完成时间。
-6. **管理端无认证**：默认仅 loopback；不要直接暴露到公网。
-7. **access log 同步写**：每请求一次 `write(2)`；高 QPS 下会拖慢事件循环，生产应改为异步日志。
-8. **配置不热加载**：SIGHUP 只打印提示；变更后端需要重启。
-9. **HTTP/1.0 客户端**：chunked 上游响应会被去分块并以关闭连接定界；不支持 HTTP/1.0 keep-alive + chunked 组合。
-10. **性能数字只对本环境有效**：WSL2、未绑核、后台负载；正式结论应多轮取中位数并记录完整环境。
+2. **HTTP/2 请求体是缓冲的**：单流上限 8 MiB、单连接总上限 32 MiB；超过返回 413。真正的流式 h2 请求体（带 h2 流控回传）是下一步。
+3. **HTTP/2 仅走 TLS/ALPN**：不支持 h2c、HTTP/2 上游、server push、trailer 转发；h2 流优先级被忽略。
+4. **TLS 边界**：单证书、无客户端证书/mTLS、无 SNI 多证书路由、无 OCSP stapling、无证书热加载；只支持 TLS 1.2/1.3。
+5. **协议升级不支持**：WebSocket、CONNECT 返回 501；这不是“透明转发”。
+6. **重试是保守的**：POST/PATCH 写出字节后不重试；需要幂等键/业务确认的更细粒度重试未实现。
+7. **响应超时按“请求已入队”计时**：极端情况下会在上游尚未完全写出 body 时开始计时；生产实现应跟踪实际 flush 完成时间。
+8. **管理端无认证**：默认仅 loopback；不要直接暴露到公网。
+9. **access log 同步写**：每请求一次 `write(2)`；高 QPS 下会拖慢事件循环，生产应改为异步日志。
+10. **配置不热加载**：SIGHUP 只打印提示；变更后端/证书需要重启。
+11. **HTTP/1.0 客户端**：chunked 上游响应会被去分块并以关闭连接定界；不支持 HTTP/1.0 keep-alive + chunked 组合。
+12. **性能数字只对本环境有效**：WSL2、未绑核、后台负载；正式结论应多轮取中位数并记录完整环境。TLS/HTTP2 目前只有功能与背压验证，**没有吞吐基准数字**。
 
 ## 文档
 
 - [ARCHITECTURE.md](ARCHITECTURE.md)：源码结构、状态机、缓冲与重试不变量；
 - [TUTORIAL.md](TUTORIAL.md)：从零实现/复刻的学习路线、检查点、面试追问、简历写法；
-- [docs/wsl-from-scratch.md](docs/wsl-from-scratch.md)：从空 WSL 目录到 GitHub 的分阶段操作手册（含分阶段 commit、SSH remote、fresh clone 验证）；
+- [docs/wsl-from-scratch.md](docs/wsl-from-scratch.md)：从空 WSL 目录到 GitHub 的分阶段操作手册（10 个 commit、TLS/HTTP2、SSH remote、fresh clone 验证；附录 D 是从 v1.0 仓库增量升级）；
 - [docs/backpressure.md](docs/backpressure.md)：慢客户端与水位设计；
 - [docs/http-semantics.md](docs/http-semantics.md)：HTTP/1.1 转发细节；
+- [docs/tls.md](docs/tls.md)：非阻塞 TLS、证书、ALPN；
+- [docs/http2.md](docs/http2.md)：HTTP/2 前端、流/交换映射、缓冲与流控；
 - [docs/retry-and-errors.md](docs/retry-and-errors.md)：重试矩阵与错误码；
 - [docs/observability.md](docs/observability.md)：指标、trace、面板；
 - [docs/benchmark.md](docs/benchmark.md)：性能方法与完整数据；
