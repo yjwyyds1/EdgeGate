@@ -115,6 +115,45 @@ void test_defaults() {
     REQUIRE_EQ(cfg.max_attempts, 2);
     REQUIRE_EQ(cfg.max_request_header_bytes, 32768u);
     REQUIRE_EQ(cfg.client_buffer_high, 256u * 1024);
+    REQUIRE(!cfg.tls_enabled);
+    REQUIRE(cfg.http2);
+}
+
+void test_tls_config() {
+    Config cfg;
+    std::string error;
+    REQUIRE(load_text(R"CONF(
+listen = 127.0.0.1:18080
+tls_listen = 127.0.0.1:18443
+tls_cert = /tmp/test-cert.pem
+tls_key = /tmp/test-key.pem
+tls_min_version = 1.3
+http2 = false
+http2_max_request_body_bytes = 2M
+http2_max_total_request_body_bytes = 8M
+http2_max_concurrent_streams = 7
+[backend a]
+url = 127.0.0.1:9001
+)CONF",
+                           cfg, error));
+    REQUIRE(cfg.tls_enabled);
+    REQUIRE_EQ(cfg.tls_listen.port, 18443);
+    REQUIRE_EQ(cfg.tls_cert, "/tmp/test-cert.pem");
+    REQUIRE_EQ(cfg.tls_key, "/tmp/test-key.pem");
+    REQUIRE_EQ(cfg.tls_min_version, "1.3");
+    REQUIRE(!cfg.http2);
+    REQUIRE_EQ(cfg.http2_max_request_body_bytes, 2u << 20);
+    REQUIRE_EQ(cfg.http2_max_total_request_body_bytes, 8u << 20);
+    REQUIRE_EQ(cfg.http2_max_concurrent_streams, 7);
+    REQUIRE(cfg.summary().find("tls=127.0.0.1:18443") != std::string::npos);
+
+    expect_invalid("tls_cert = /tmp/c.pem\n[backend a]\nurl=127.0.0.1:1\n",
+                   "set tls_listen");
+    expect_invalid("tls_listen = 127.0.0.1:18443\n[backend a]\nurl=127.0.0.1:1\n",
+                   "tls_cert");
+    expect_invalid("tls_listen = 127.0.0.1:18443\ntls_cert=x\ntls_key=y\n"
+                   "tls_min_version = 1.1\n[backend a]\nurl=127.0.0.1:1\n",
+                   "1.2 or 1.3");
 }
 
 }  // namespace
@@ -124,6 +163,7 @@ int main() {
         test_valid_config();
         test_invalid_configs();
         test_defaults();
+        test_tls_config();
     } catch (const std::exception& e) {
         std::cerr << "config_test failed: " << e.what() << "\n";
         return 1;

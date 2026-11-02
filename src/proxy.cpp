@@ -25,7 +25,12 @@
 #include "edgegate/http.hpp"
 #include "edgegate/log.hpp"
 #include "edgegate/retry.hpp"
+#include "edgegate/tls.hpp"
 #include "edgegate/util.hpp"
+
+#ifdef EDGEGATE_HAVE_NGHTTP2
+#include <nghttp2/nghttp2.h>
+#endif
 
 namespace eg {
 namespace {
@@ -77,6 +82,9 @@ struct ProxyServer::Impl : EventHandler {
     struct ClientConn;
     struct UpstreamConn;
     struct HealthConn;
+    struct H2Session;
+    struct H2Stream;
+    struct UpstreamOwner;
 
     Impl(Config config, ProxyServer* owner);
     ~Impl();
@@ -86,7 +94,7 @@ struct ProxyServer::Impl : EventHandler {
     void request_stop();
     void on_event(int fd, std::uint32_t events) override;
 
-    void accept_clients();
+    void accept_clients(bool tls);
     void handle_signal();
     void tick(std::int64_t now);
     void reap();
@@ -95,7 +103,7 @@ struct ProxyServer::Impl : EventHandler {
     Backend* select_backend(const std::vector<Backend*>& exclude);
     std::vector<BackendSnapshot> snapshots() const;
 
-    UpstreamConn* acquire_upstream(Backend* backend, ClientConn* owner, std::string& error,
+    UpstreamConn* acquire_upstream(Backend* backend, UpstreamOwner* owner, std::string& error,
                                    bool& connect_failed, bool& pool_full);
     void release_upstream(UpstreamConn* up, bool reusable);
     void destroy_upstream(UpstreamConn* up, bool abort);
@@ -123,8 +131,10 @@ struct ProxyServer::Impl : EventHandler {
     std::vector<BackendSnapshot> last_snapshots;
 
     int listen_fd = -1;
+    int tls_listen_fd = -1;
     int signal_fd = -1;
     int access_fd = -1;
+    std::unique_ptr<TlsContext> tls_ctx;
     bool shutting_down = false;
     bool global_backpressure = false;
     std::int64_t shutdown_deadline_ms = 0;
@@ -145,10 +155,20 @@ struct ProxyServer::Impl : EventHandler {
     std::size_t trace_pos = 0;
 };
 
+struct ProxyServer::Impl::UpstreamOwner {
+    virtual ~UpstreamOwner() = default;
+    virtual void on_upstream_ready() = 0;
+    virtual void on_upstream_failure(std::string reason, bool connect_failure,
+                                     int status_hint) = 0;
+    virtual void on_upstream_readable() = 0;
+    virtual void on_upstream_eof() = 0;
+    virtual void on_upstream_writable() = 0;
+};
+
 struct ProxyServer::Impl::UpstreamConn : EventHandler {
     Impl* server = nullptr;
     Backend* backend = nullptr;
-    ClientConn* owner = nullptr;
+    UpstreamOwner* owner = nullptr;
     int fd = -1;
     Buffer in;
     Buffer out;
@@ -172,7 +192,7 @@ struct ProxyServer::Impl::UpstreamConn : EventHandler {
     void reset_transport();
 };
 
-struct ProxyServer::Impl::ClientConn : EventHandler {
+struct ProxyServer::Impl::ClientConn : EventHandler, UpstreamOwner {
     enum class State {
         ReadRequest,
         Dispatching,
@@ -235,6 +255,17 @@ struct ProxyServer::Impl::ClientConn : EventHandler {
     bool request_active = false;
     bool trace_committed = false;
 
+    std::unique_ptr<TlsConnection> tls;
+    bool tls_handshaking = false;
+    bool tls_want_write = false;
+    bool io_want_read = false;
+    bool io_want_write = false;
+    std::int64_t tls_started_ms = 0;
+
+    std::unique_ptr<H2Session> h2;
+    bool h2_mode = false;
+    bool close_requested = false;
+
     State state = State::ReadRequest;
     std::int64_t last_activity_ms = 0;
     std::int64_t head_started_ms = 0;
@@ -250,7 +281,7 @@ struct ProxyServer::Impl::ClientConn : EventHandler {
 
     RequestTrace trace;
 
-    ClientConn(Impl* s, int socket_fd, std::string ip)
+    ClientConn(Impl* s, int socket_fd, std::string ip, SSL_CTX* tls_ctx = nullptr)
         : server(s),
           fd(socket_fd),
           key_fd(socket_fd),
@@ -259,8 +290,20 @@ struct ProxyServer::Impl::ClientConn : EventHandler {
           resp_parser(s->cfg.max_response_header_bytes) {
         last_activity_ms = now_ms();
         last_out_progress_ms = last_activity_ms;
+        if (tls_ctx) {
+            tls = std::make_unique<TlsConnection>(tls_ctx, socket_fd);
+            tls_handshaking = true;
+            tls_started_ms = last_activity_ms;
+        }
     }
-    ~ClientConn() override = default;
+    ~ClientConn() override;
+
+    void start();
+    void start_h2();
+    void set_events(std::uint32_t want);
+    IoStatus client_read(void* buffer, std::size_t size, std::size_t& got);
+    IoStatus client_write(const void* buffer, std::size_t size, std::size_t& wrote);
+    void handle_tls_handshake(std::uint32_t ev);
 
     void on_event(int event_fd, std::uint32_t ev) override;
     void on_readable();
@@ -321,6 +364,8 @@ struct ProxyServer::Impl::HealthConn : EventHandler {
     void on_tick(std::int64_t now);
 };
 
+#include "h2_impl.inc"
+
 // ---------------------------------------------------------------------------
 // Impl
 // ---------------------------------------------------------------------------
@@ -330,6 +375,7 @@ ProxyServer::Impl::Impl(Config config, ProxyServer* owner)
 
 ProxyServer::Impl::~Impl() {
     if (listen_fd >= 0) ::close(listen_fd);
+    if (tls_listen_fd >= 0) ::close(tls_listen_fd);
     if (signal_fd >= 0) ::close(signal_fd);
     if (access_fd >= 0) ::close(access_fd);
 }
@@ -349,6 +395,33 @@ bool ProxyServer::Impl::init(std::string& error) {
     if (!loop.add(listen_fd, EPOLLIN, this)) {
         error = "cannot register listener";
         return false;
+    }
+
+    if (cfg.tls_enabled) {
+        tls_ctx = std::make_unique<TlsContext>();
+        TlsOptions options{cfg.tls_cert, cfg.tls_key, cfg.tls_min_version, cfg.http2};
+        std::string tls_error;
+        if (!tls_ctx->init(options, tls_error)) {
+            error = "TLS init failed: " + tls_error;
+            return false;
+        }
+        tls_listen_fd = create_listener(cfg.tls_listen, 512, error);
+        if (tls_listen_fd < 0) {
+            error = "TLS listener: " + error;
+            return false;
+        }
+        if (!loop.add(tls_listen_fd, EPOLLIN, this)) {
+            error = "cannot register TLS listener";
+            return false;
+        }
+        log_msg(LogLevel::Info, "TLS listening on ", cfg.tls_listen.authority(), " (ALPN ",
+                cfg.http2 ? "h2,http/1.1" : "http/1.1", ", min TLS ", cfg.tls_min_version, ")");
+#ifndef EDGEGATE_HAVE_NGHTTP2
+        if (cfg.http2) {
+            log_msg(LogLevel::Warn,
+                    "http2=true but EdgeGate was built without nghttp2; ALPN will only offer http/1.1");
+        }
+#endif
     }
 
     ::signal(SIGPIPE, SIG_IGN);
@@ -388,7 +461,11 @@ bool ProxyServer::Impl::init(std::string& error) {
 
 void ProxyServer::Impl::on_event(int fd, std::uint32_t ev) {
     if (fd == listen_fd) {
-        if (ev & EPOLLIN) accept_clients();
+        if (ev & EPOLLIN) accept_clients(false);
+        return;
+    }
+    if (fd == tls_listen_fd) {
+        if (ev & EPOLLIN) accept_clients(true);
         return;
     }
     if (fd == signal_fd) {
@@ -396,11 +473,12 @@ void ProxyServer::Impl::on_event(int fd, std::uint32_t ev) {
     }
 }
 
-void ProxyServer::Impl::accept_clients() {
+void ProxyServer::Impl::accept_clients(bool tls) {
+    const int listener = tls ? tls_listen_fd : listen_fd;
     for (;;) {
         sockaddr_storage ss{};
         socklen_t len = sizeof(ss);
-        const int fd = ::accept4(listen_fd, reinterpret_cast<sockaddr*>(&ss), &len,
+        const int fd = ::accept4(listener, reinterpret_cast<sockaddr*>(&ss), &len,
                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR) continue;
@@ -414,7 +492,8 @@ void ProxyServer::Impl::accept_clients() {
         set_tcp_nodelay(fd);
         set_keepalive(fd);
         const std::string ip = peer_ip(fd);
-        auto client = std::make_unique<ClientConn>(this, fd, ip);
+        SSL_CTX* ssl_ctx = tls && tls_ctx ? tls_ctx->ctx() : nullptr;
+        auto client = std::make_unique<ClientConn>(this, fd, ip, ssl_ctx);
         ClientConn* raw = client.get();
         clients.emplace(fd, std::move(client));
         if (!loop.add(fd, EPOLLIN | EPOLLRDHUP, raw)) {
@@ -422,7 +501,7 @@ void ProxyServer::Impl::accept_clients() {
             ::close(fd);
             continue;
         }
-        raw->update_events();
+        raw->start();
         metrics.client_connections_total.inc();
         metrics.active_clients.inc();
     }
@@ -450,6 +529,10 @@ void ProxyServer::Impl::request_stop() {
         loop.close_later(listen_fd);
         listen_fd = -1;
     }
+    if (tls_listen_fd >= 0) {
+        loop.close_later(tls_listen_fd);
+        tls_listen_fd = -1;
+    }
     if (admin) admin->close();
     log_msg(LogLevel::Info, "stopping: no new connections, grace ", cfg.shutdown_grace_ms, " ms");
 }
@@ -466,7 +549,7 @@ std::vector<BackendSnapshot> ProxyServer::Impl::snapshots() const {
 }
 
 ProxyServer::Impl::UpstreamConn* ProxyServer::Impl::acquire_upstream(Backend* backend,
-                                                                     ClientConn* owner,
+                                                                     UpstreamOwner* owner,
                                                                      std::string& error,
                                                                      bool& connect_failed,
                                                                      bool& pool_full) {
@@ -645,6 +728,10 @@ void ProxyServer::Impl::update_global_gauges() {
         if (c->closed) continue;
         buffered += static_cast<std::int64_t>(c->in.size() + c->out.size());
         if (c->request_active) ++active_requests;
+        if (c->h2_mode && c->h2) {
+            buffered += static_cast<std::int64_t>(c->h2->buffered_bytes());
+            active_requests += static_cast<std::int64_t>(c->h2->active_streams());
+        }
     }
     for (auto& [fd, u] : upstreams) {
         if (u->dead) continue;
@@ -757,6 +844,10 @@ void ProxyServer::Impl::shutdown_cleanup() {
         ::close(listen_fd);
         listen_fd = -1;
     }
+    if (tls_listen_fd >= 0) {
+        ::close(tls_listen_fd);
+        tls_listen_fd = -1;
+    }
     if (signal_fd >= 0) {
         ::close(signal_fd);
         signal_fd = -1;
@@ -831,7 +922,7 @@ std::string ProxyServer::Impl::status_json() const {
     const std::int64_t uptime = (now_ms() - start_ms) / 1000;
     std::ostringstream os;
     os << "{"
-       << "\"service\":\"edgegate\",\"version\":\"1.0.0\","
+       << "\"service\":\"edgegate\",\"version\":\"1.1.0\","
        << "\"uptime_seconds\":" << uptime << ","
        << "\"config\":{"
        << "\"listen\":\"" << json_escape(cfg.listen.authority()) << "\","
@@ -999,9 +1090,102 @@ void ProxyServer::Impl::UpstreamConn::reset_transport() {
 // ClientConn
 // ---------------------------------------------------------------------------
 
+void ProxyServer::Impl::ClientConn::start() {
+    if (closed) return;
+    if (tls_handshaking) {
+        handle_tls_handshake(0);
+        return;
+    }
+    update_events();
+}
+
+IoStatus ProxyServer::Impl::ClientConn::client_read(void* buffer, std::size_t size,
+                                                    std::size_t& got) {
+    got = 0;
+    if (tls) return tls->read(buffer, size, got);
+    for (;;) {
+        const ssize_t n = ::recv(fd, buffer, size, 0);
+        if (n > 0) {
+            got = static_cast<std::size_t>(n);
+            return IoStatus::Ok;
+        }
+        if (n == 0) return IoStatus::Eof;
+        if (errno == EINTR) continue;
+        if (eagain(errno)) return IoStatus::WantRead;
+        return IoStatus::Error;
+    }
+}
+
+IoStatus ProxyServer::Impl::ClientConn::client_write(const void* buffer, std::size_t size,
+                                                     std::size_t& wrote) {
+    wrote = 0;
+    if (tls) return tls->write(buffer, size, wrote);
+    for (;;) {
+        const ssize_t n = ::send(fd, buffer, size, MSG_NOSIGNAL);
+        if (n > 0) {
+            wrote = static_cast<std::size_t>(n);
+            return IoStatus::Ok;
+        }
+        if (n == 0) return IoStatus::Error;
+        if (errno == EINTR) continue;
+        if (eagain(errno)) return IoStatus::WantWrite;
+        return IoStatus::Error;
+    }
+}
+
+void ProxyServer::Impl::ClientConn::handle_tls_handshake(std::uint32_t ev) {
+    if (!tls || !tls_handshaking || closed) return;
+    const IoStatus st = tls->handshake();
+    if (st == IoStatus::Ok) {
+        tls_handshaking = false;
+        tls_want_write = false;
+        last_activity_ms = now_ms();
+        const std::string alpn = tls->alpn();
+        log_msg(LogLevel::Debug, "TLS handshake complete from ", client_ip, " ALPN=",
+                alpn.empty() ? "(none)" : alpn);
+        if (alpn == "h2" && server->cfg.http2) {
+            start_h2();
+            if (h2_mode && h2) {
+                h2->on_event(ev);
+                if (close_requested) close_now();
+                return;
+            }
+        }
+        update_events();
+        if (ev & EPOLLIN) on_readable();
+        if (!closed && (ev & EPOLLOUT)) on_writable();
+        return;
+    }
+    if (st == IoStatus::WantRead) {
+        tls_want_write = false;
+        update_events();
+        return;
+    }
+    if (st == IoStatus::WantWrite) {
+        tls_want_write = true;
+        update_events();
+        return;
+    }
+    log_msg(LogLevel::Debug, "TLS handshake failed from ", client_ip, ": ", tls_last_error());
+    close_now();
+}
+
 void ProxyServer::Impl::ClientConn::on_event(int event_fd, std::uint32_t ev) {
     (void)event_fd;
     if (closed) return;
+    if (tls_handshaking) {
+        if (ev & EPOLLERR) {
+            close_now();
+            return;
+        }
+        handle_tls_handshake(ev);
+        return;
+    }
+    if (h2_mode) {
+        if (h2) h2->on_event(ev);
+        if (close_requested) close_now();
+        return;
+    }
     if (ev & EPOLLERR) {
         close_now();
         return;
@@ -1028,9 +1212,30 @@ bool ProxyServer::Impl::ClientConn::read_allowed() const {
 
 void ProxyServer::Impl::ClientConn::update_events() {
     if (fd < 0 || closed) return;
+    if (h2_mode) {
+        if (h2) h2->update_events();
+        return;
+    }
     std::uint32_t want = EPOLLRDHUP;
+    if (tls_handshaking) {
+        want |= tls_want_write ? EPOLLOUT : EPOLLIN;
+        if (want != events) {
+            events = want;
+            server->loop.mod(fd, want);
+        }
+        return;
+    }
     if (read_allowed()) want |= EPOLLIN;
-    if (!out.empty()) want |= EPOLLOUT;
+    if (io_want_read) want |= EPOLLIN;
+    if (!out.empty() || io_want_write) want |= EPOLLOUT;
+    if (want != events) {
+        events = want;
+        server->loop.mod(fd, want);
+    }
+}
+
+void ProxyServer::Impl::ClientConn::set_events(std::uint32_t want) {
+    if (fd < 0 || closed) return;
     if (want != events) {
         events = want;
         server->loop.mod(fd, want);
@@ -1066,27 +1271,37 @@ void ProxyServer::Impl::ClientConn::maybe_resume_upstream() {
 }
 
 void ProxyServer::Impl::ClientConn::on_readable() {
-    if (closed) return;
+    if (closed || tls_handshaking) return;
+    if (h2_mode) {
+        if (h2) h2->on_readable();
+        if (close_requested) close_now();
+        return;
+    }
+    io_want_read = false;
     char buf[kRecvChunk];
     for (;;) {
         if (!read_allowed()) break;
         const std::size_t cap = server->cfg.max_request_header_bytes + kRecvChunk;
         if (in.size() >= cap) break;
-        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n > 0) {
-            in.append(buf, static_cast<std::size_t>(n));
+        std::size_t got = 0;
+        const IoStatus st = client_read(buf, sizeof(buf), got);
+        if (st == IoStatus::Ok && got > 0) {
+            in.append(buf, got);
             last_activity_ms = now_ms();
             if (state == State::ReadRequest && !req_head_done && head_started_ms == 0) {
                 head_started_ms = last_activity_ms;
             }
             handle_input();
             if (closed) return;
-        } else if (n == 0) {
+        } else if (st == IoStatus::WantRead) {
+            break;
+        } else if (st == IoStatus::WantWrite) {
+            io_want_write = true;
+            break;
+        } else if (st == IoStatus::Eof) {
             on_client_eof();
             return;
         } else {
-            if (errno == EINTR) continue;
-            if (eagain(errno)) break;
             server->metrics.read_errors.inc();
             close_now();
             return;
@@ -1097,6 +1312,11 @@ void ProxyServer::Impl::ClientConn::on_readable() {
 
 void ProxyServer::Impl::ClientConn::on_writable() {
     if (closed) return;
+    if (h2_mode) {
+        if (h2) h2->on_writable();
+        if (close_requested) close_now();
+        return;
+    }
     flush_client_out();
     if (closed) return;
     if (out.empty()) {
@@ -1115,14 +1335,19 @@ void ProxyServer::Impl::ClientConn::on_writable() {
 }
 
 void ProxyServer::Impl::ClientConn::flush_client_out() {
+    if (closed) return;
+    io_want_write = false;
     while (!out.empty()) {
-        const ssize_t n = ::send(fd, out.data(), out.size(), MSG_NOSIGNAL);
-        if (n > 0) {
-            out.consume(static_cast<std::size_t>(n));
+        std::size_t wrote = 0;
+        const IoStatus st = client_write(out.data(), out.size(), wrote);
+        if (st == IoStatus::Ok && wrote > 0) {
+            out.consume(wrote);
             last_out_progress_ms = now_ms();
-        } else if (n < 0 && errno == EINTR) {
-            continue;
-        } else if (n < 0 && eagain(errno)) {
+        } else if (st == IoStatus::WantWrite) {
+            io_want_write = true;
+            break;
+        } else if (st == IoStatus::WantRead) {
+            io_want_read = true;
             break;
         } else {
             server->metrics.write_errors.inc();
@@ -1806,6 +2031,12 @@ void ProxyServer::Impl::ClientConn::close_now() {
         server->destroy_upstream(up, true);
         up = nullptr;
     }
+    if (h2) {
+        h2->shutdown();
+        h2.reset();
+        h2_mode = false;
+    }
+    if (tls) tls->shutdown();
     if (fd >= 0) {
         server->loop.close_later(fd);
         server->zombie_clients.push_back(key_fd);
@@ -1817,6 +2048,11 @@ void ProxyServer::Impl::ClientConn::close_now() {
 
 void ProxyServer::Impl::ClientConn::on_client_eof() {
     if (closed) return;
+    if (h2_mode) {
+        if (h2) h2->on_client_eof();
+        if (close_requested) close_now();
+        return;
+    }
     client_eof = true;
     set_client_paused(true, false);
     if (state == State::ReadRequest || (state == State::SendingBody && !req_body_done)) {
@@ -1830,6 +2066,18 @@ void ProxyServer::Impl::ClientConn::on_client_eof() {
 
 void ProxyServer::Impl::ClientConn::on_tick(std::int64_t now) {
     if (closed) return;
+    if (h2_mode) {
+        if (h2) h2->on_tick(now);
+        if (close_requested) close_now();
+        return;
+    }
+    if (tls_handshaking) {
+        if (now - tls_started_ms > server->cfg.tls_handshake_timeout_ms) {
+            log_msg(LogLevel::Debug, "TLS handshake timeout from ", client_ip);
+            close_now();
+        }
+        return;
+    }
     if (!out.empty() && now - last_out_progress_ms > server->cfg.client_write_stall_ms) {
         log_msg(LogLevel::Warn, "client ", client_ip, " write stalled for ",
                 now - last_out_progress_ms, " ms; closing");

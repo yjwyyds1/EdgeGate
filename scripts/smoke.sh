@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# WSL 的 .bashrc 经常导出 http_proxy/https_proxy；本地冒烟测试必须绕过代理，
+# 否则 curl 会把 127.0.0.1 也发给 Windows 代理，出现 "via 10.255.255.254"。
+export no_proxy='*'
+export NO_PROXY='*'
 BIN="$(cd "$(dirname "$0")/.." && pwd)/build"
 WORK=/tmp/eg-smoke
 rm -rf "$WORK"

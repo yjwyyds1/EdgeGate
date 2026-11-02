@@ -22,6 +22,18 @@ struct Config {
     Endpoint admin{"127.0.0.1", 9900};
     bool admin_enabled = true;
 
+    // TLS / HTTP2
+    bool tls_enabled = false;
+    Endpoint tls_listen{"0.0.0.0", 8443};
+    std::string tls_cert;
+    std::string tls_key;
+    std::string tls_min_version = "1.2";  // "1.2" or "1.3"
+    bool http2 = true;
+    std::int64_t tls_handshake_timeout_ms = 10000;
+    std::size_t http2_max_request_body_bytes = 8u << 20;
+    std::size_t http2_max_total_request_body_bytes = 32u << 20;
+    int http2_max_concurrent_streams = 32;
+
     std::string balancer = "least_conn";  // round_robin | least_conn
     bool preserve_host = true;
     bool retry_idempotent_only = true;

@@ -8,7 +8,8 @@
 namespace {
 
 void usage(const char* argv0) {
-    std::cout << "EdgeGate " << "1.0.0" << " - HTTP/1.1 reverse proxy and load balancer\n\n"
+    std::cout << "EdgeGate " << "1.1.0"
+              << " - HTTP/1.1 + HTTP/2 reverse proxy with optional TLS\n\n"
               << "Usage: " << argv0 << " [options]\n\n"
               << "  --config PATH       配置文件（默认 config/edgegate.conf）\n"
               << "  --check-config      只校验配置并打印生效值，不启动监听\n"
@@ -39,7 +40,7 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--log-level=", 0) == 0) log_level = arg.substr(12);
         else if (arg == "--check-config") check_only = true;
         else if (arg == "--version") {
-            std::cout << "edgegate 1.0.0\n";
+            std::cout << "edgegate 1.1.0\n";
             return 0;
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0]);

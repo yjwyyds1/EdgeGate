@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export no_proxy='*'
+export NO_PROXY='*'
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT_DIR/build-release"
 WORK=/tmp/eg-bench

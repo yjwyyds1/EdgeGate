@@ -205,6 +205,36 @@ bool Config::load(const std::string& path, Config& out, std::string& error) {
     if (!take_int("max_attempts", out.max_attempts, 1, 10)) return false;
     if (!take_size("retry_body_buffer_bytes", out.retry_body_buffer_bytes, 0, 1u << 30)) return false;
 
+    // ---- TLS / HTTP2 ----
+    std::string tls_text;
+    if (take("tls_listen", tls_text)) {
+        out.tls_enabled = true;
+        std::string why;
+        if (!parse_endpoint(tls_text, out.tls_listen, why)) return fail("tls_listen", why);
+    }
+    if (!take_string("tls_cert", out.tls_cert)) return false;
+    if (!take_string("tls_key", out.tls_key)) return false;
+    if (!take_string("tls_min_version", out.tls_min_version)) return false;
+    if (out.tls_min_version != "1.2" && out.tls_min_version != "1.3") {
+        return fail("tls_min_version", "expected 1.2 or 1.3");
+    }
+    if (!take_bool("http2", out.http2)) return false;
+    if (!take_i64("tls_handshake_timeout_ms", out.tls_handshake_timeout_ms, 1, 600000)) return false;
+    if (!take_size("http2_max_request_body_bytes", out.http2_max_request_body_bytes, 1024,
+                   1ull << 30)) return false;
+    if (!take_size("http2_max_total_request_body_bytes", out.http2_max_total_request_body_bytes,
+                   1024, 1ull << 32)) return false;
+    if (!take_int("http2_max_concurrent_streams", out.http2_max_concurrent_streams, 1, 1000)) {
+        return false;
+    }
+    if (out.tls_enabled) {
+        if (out.tls_cert.empty() || out.tls_key.empty()) {
+            return fail("tls_cert", "TLS requires both tls_cert and tls_key");
+        }
+    } else if (!out.tls_cert.empty() || !out.tls_key.empty()) {
+        return fail("tls_cert", "set tls_listen to enable TLS");
+    }
+
     if (!take_i64("client_header_timeout_ms", out.client_header_timeout_ms, 1, 3600000)) return false;
     if (!take_i64("client_idle_timeout_ms", out.client_idle_timeout_ms, 1, 86400000)) return false;
     if (!take_i64("client_write_stall_ms", out.client_write_stall_ms, 1, 86400000)) return false;
@@ -318,7 +348,10 @@ bool Config::load(const std::string& path, Config& out, std::string& error) {
 std::string Config::summary() const {
     std::ostringstream os;
     os << "listen=" << listen.authority() << " admin="
-       << (admin_enabled ? admin.authority() : "off") << " balancer=" << balancer
+       << (admin_enabled ? admin.authority() : "off")
+       << " tls=" << (tls_enabled ? tls_listen.authority() : "off")
+       << " tls_min=" << tls_min_version << " http2=" << (http2 ? "on" : "off")
+       << " balancer=" << balancer
        << " backends=" << backends.size() << " max_attempts=" << max_attempts
        << " preserve_host=" << (preserve_host ? "true" : "false")
        << " client_buffer=" << client_buffer_low << "/" << client_buffer_high
