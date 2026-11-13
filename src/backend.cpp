@@ -13,6 +13,7 @@ Backend::Backend(const BackendConfig& cfg, const Config& global)
       max_connections_(cfg.max_connections ? cfg.max_connections
                                            : global.max_connections_per_backend),
       max_idle_(cfg.max_idle ? cfg.max_idle : global.max_idle_connections_per_backend),
+      http2_(cfg.http2),
       healthy_threshold_(global.healthy_threshold),
       unhealthy_threshold_(global.unhealthy_threshold),
       cooldown_ms_(global.passive_failure_cooldown_ms) {}

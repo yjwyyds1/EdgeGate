@@ -11,7 +11,7 @@ EdgeGate 是一个面向 Linux/WSL2 的单线程非阻塞反向代理：客户�
 - **重试安全边界**：POST/PATCH 写出请求后绝不无条件重发；
 - **可观测性**：Prometheus 指标、JSON 访问日志、请求级 trace、内置管理面板。
 
-当前源码对应 **v1.1**。明确未实现 HTTP/3、h2c、上游 TLS、客户端证书、WebSocket/CONNECT、多 worker 和配置热加载；这些是扩展方向，而不是“已经支持但没写文档”。
+当前源码对应 **v1.3**。明确未实现 HTTP/3、h2c 前端、上游 TLS、客户端证书、共享内存指标聚合和配置热加载；这些是扩展方向，而不是“已经支持但没写文档”。
 
 > 定位：单机、单事件循环的教学/面试级代理。它接受真实 HTTP/1.1/HTTP/2 流量，但不宣称生产级高可用、TLS 集群或百万并发。
 
@@ -22,6 +22,9 @@ EdgeGate 是一个面向 Linux/WSL2 的单线程非阻塞反向代理：客户�
 | HTTP/1.1 代理 | 请求行/头/体转发，keep-alive，HTTP/1.0 客户端，absolute-form |
 | TLS 终止 | OpenSSL 非阻塞握手、`tls_cert/tls_key`、TLS 1.2/1.3、ALPN、握手超时 |
 | HTTP/2 前端 | nghttp2 server session、ALPN h2、GET/POST、多路复用、流级响应、流控 |
+| HTTP/2 上游 | `backend http2=true` 时 h2c prior-knowledge；h1/h2 客户端均可转发 |
+| WebSocket / CONNECT | `Upgrade: websocket` 与 `CONNECT` 双向原始隧道 |
+| 多 worker | `num_workers>1`：fork + `SO_REUSEPORT`，每 worker 独立 epoll；仅 worker 0 开 admin |
 | 请求体 | HTTP/1.1：CL/chunked 流式；HTTP/2：缓冲至 `http2_max_request_body_bytes` |
 | 响应体 | CL、chunked、close-delimited；HTTP/1.1 自动重新分帧；HTTP/2 data provider 流式 |
 | 特殊响应 | HEAD、204、304、1xx interim、101（转发后关闭） |
@@ -39,13 +42,13 @@ EdgeGate 是一个面向 Linux/WSL2 的单线程非阻塞反向代理：客户�
 
 **明确未实现**
 
-- HTTP/3、h2c（明文 HTTP/2）、HTTP/2 上游、server push、HTTP/2 trailer 转发；
+- HTTP/3、h2c（明文 HTTP/2 前端）、server push、HTTP/2 trailer 转发；
 - 上游 TLS/mTLS、客户端证书认证、多证书/SNI 路由、OCSP stapling；
-- WebSocket、CONNECT 隧道、协议升级（返回 501）；
-- 多 worker/多线程事件循环、SO_REUSEPORT；
+- 多 worker 之间健康状态/指标不共享（每进程独立）；admin 只在 worker 0；
 - 配置热加载（SIGHUP 只记录日志）；
 - 管理端认证（默认只绑定 127.0.0.1）；
 - 缓存、压缩、限流、WAF、动态服务发现。
+- CONNECT 任意外网目标（反向代理语义：隧道到被选中的 backend）。
 
 ## 快速开始
 
@@ -469,7 +472,7 @@ ctest --test-dir build --output-on-failure
 | `balancer_test` | round-robin、least-conn、健康/冷却/draining、排除 |
 | `retry_test` | POST/GET 重试矩阵、attempt 上限、不可重放 body |
 | `metrics_test` | 计数器/直方图/分位数/Prometheus 输出 |
-| `integration_test` | 26 个端到端场景（HTTP/1.1 + TLS + HTTP/2，见下） |
+| `integration_test` | 30 个端到端场景（h1/TLS/h2 前端/上游 h2/隧道/多 worker） |
 
 集成测试会启动 3 个真实 `eg_demo` 实例和代理，覆盖：
 
@@ -488,7 +491,7 @@ ctest --test-dir build --output-on-failure
 - HTTP/2 多路复用（同一 TLS 连接两个 stream）、chunked/HEAD/204、请求体 413、响应超时 504、慢客户端背压、重试语义；
 - SIGTERM 优雅退出。
 
-实测一次完整运行：`26/26 passed`（HTTP/2 构建），CTest 总计约 15 秒。
+实测一次完整运行：`30/30 passed`（HTTP/2 构建），CTest 总计约 16 秒。
 
 ## 性能结果
 
@@ -583,8 +586,7 @@ EdgeGate/
 - [docs/backpressure.md](docs/backpressure.md)：慢客户端与水位设计；
 - [docs/http-semantics.md](docs/http-semantics.md)：HTTP/1.1 转发细节；
 - [docs/tls.md](docs/tls.md)：非阻塞 TLS、证书、ALPN；
-- [docs/http2.md](docs/http2.md)：HTTP/2 前端、流/交换映射、缓冲与流控；
-- [docs/retry-and-errors.md](docs/retry-and-errors.md)：重试矩阵与错误码；
-- [docs/observability.md](docs/observability.md)：指标、trace、面板；
+- [docs/http2.md](docs/http2.md)：HTTP/2 前端、上游 h2c、隧道；
+- [docs/multi-worker.md](docs/multi-worker.md)：`num_workers` 与 SO_REUSEPORT；
 - [docs/benchmark.md](docs/benchmark.md)：性能方法与完整数据；
 - [docs/manual-test-report.md](docs/manual-test-report.md)：手工验收记录。

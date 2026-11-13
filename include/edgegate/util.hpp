@@ -46,7 +46,8 @@ void set_tcp_nodelay(int fd);
 void set_keepalive(int fd);
 
 // 绑定并监听，返回非阻塞 fd；失败返回 -1 并写入 error。
-int create_listener(const Endpoint& ep, int backlog, std::string& error);
+// backlog 为 listen 队列；reuse_port 为 true 时设置 SO_REUSEPORT（多 worker）。
+int create_listener(const Endpoint& ep, int backlog, std::string& error, bool reuse_port = false);
 
 // 非阻塞 connect。返回 fd；-1 表示立即失败；*in_progress=true 表示需要等待 EPOLLOUT。
 int connect_nonblocking(const Endpoint& ep, bool& in_progress, std::string& error);

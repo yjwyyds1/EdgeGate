@@ -342,6 +342,20 @@ void ProxyServer::Impl::H2Stream::on_upstream_ready() {
     up->connecting = false;
     up->update_events();
 
+    if (up->h2_mode) {
+        std::string why;
+        if (!up->h2_submit_request(req, body, backend->endpoint().authority(), client_ip, request_id,
+                                   server->cfg.preserve_host, why)) {
+            on_upstream_failure(why.empty() ? "h2 upstream submit failed" : why, false, 502);
+            return;
+        }
+        request_bytes_written = true;
+        state = State::Waiting;
+        request_sent_ms = now;
+        up->update_events();
+        return;
+    }
+
     const std::string head = build_request_head(req, backend->endpoint().authority(),
                                                 client_ip, request_id,
                                                 server->cfg.preserve_host, false);
@@ -377,6 +391,26 @@ void ProxyServer::Impl::H2Stream::on_upstream_writable() { flush_request(); }
 
 void ProxyServer::Impl::H2Stream::on_upstream_readable() {
     if (closed || !up || up->connecting || up_read_paused) return;
+    if (up->h2_mode) {
+        // h2 适配器已把响应写入 up->in；若 h2 已结束且 in 空，当作 EOF
+        if (up->h2_failed) {
+            on_upstream_failure(up->h2_error.empty() ? "upstream h2 failed" : up->h2_error, false, 502);
+            return;
+        }
+        process_upstream_input();
+        if (closed || !up) return;
+        if (up->h2_body_done && up->in.empty() && resp_head_done &&
+            resp_mode == BodyMode::UntilClose) {
+            on_upstream_eof();
+            return;
+        }
+        if (up->h2_body_done && up->in.empty() && !resp_head_done) {
+            on_upstream_failure("upstream h2 closed before response", false, 502);
+            return;
+        }
+        if (up) up->update_events();
+        return;
+    }
     if (pending_bytes() >= server->cfg.client_buffer_high) {
         set_up_paused(true);
         return;

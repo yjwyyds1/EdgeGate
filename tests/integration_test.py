@@ -360,9 +360,16 @@ def write_config(name, listen, admin, backends, **opts):
     lines = [f"listen = {HOST}:{listen}", f"admin_listen = {HOST}:{admin}"]
     for k, v in values.items():
         lines.append(f"{k} = {v}")
-    for bname, bport in backends:
+    for item in backends:
+        if len(item) == 2:
+            bname, bport = item
+            bopts = {}
+        else:
+            bname, bport, bopts = item
         lines.append(f"\n[backend {bname}]")
         lines.append(f"url = http://{HOST}:{bport}")
+        for bk, bv in bopts.items():
+            lines.append(f"{bk} = {bv}")
     path = os.path.join(CONFIGS, name + ".conf")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -1091,6 +1098,173 @@ def test_h2_retry_semantics(ctx):
         pass
 
 
+def test_websocket_tunnel(ctx):
+    # WebSocket 升级后原始字节隧道：demo /api/ws 回显
+    import base64
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = (
+        f"GET /api/ws HTTP/1.1\r\n"
+        f"Host: {HOST}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"\r\n"
+    ).encode()
+    s = socket.create_connection((HOST, ctx.proxy), timeout=5)
+    try:
+        s.sendall(req)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(4096)
+            assert chunk, "eof before websocket handshake"
+            data += chunk
+        head, rest = data.split(b"\r\n\r\n", 1)
+        assert b"101" in head.split(b"\r\n", 1)[0], head[:200]
+        assert b"upgrade: websocket" in head.lower()
+        payload = b"tunnel-hello-" + os.urandom(32)
+        s.sendall(rest + payload if rest else payload)
+        # 回显可能分片
+        got = b""
+        while len(got) < len(payload):
+            chunk = s.recv(4096)
+            assert chunk, "eof before echo complete"
+            got += chunk
+        assert got.startswith(payload) or payload in got or got == payload, (got[:64], payload[:64])
+        assert got == payload, (len(got), len(payload), got[:40], payload[:40])
+    finally:
+        s.close()
+
+
+def test_connect_tunnel(ctx):
+    # CONNECT 隧道：连上后向后端发原始 HTTP 请求（经隧道直达 backend）
+    backend_port = ctx.backend_ports["app-a"]
+    req = (
+        f"CONNECT {HOST}:{backend_port} HTTP/1.1\r\n"
+        f"Host: {HOST}:{backend_port}\r\n"
+        f"\r\n"
+    ).encode()
+    s = socket.create_connection((HOST, ctx.proxy), timeout=5)
+    try:
+        s.sendall(req)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(4096)
+            assert chunk, "eof before CONNECT response"
+            data += chunk
+        head, rest = data.split(b"\r\n\r\n", 1)
+        assert b"200" in head.split(b"\r\n", 1)[0], head[:200]
+        # 隧道已建立：发真实 HTTP 到 backend
+        inner = (
+            f"GET /api/info HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n"
+        ).encode()
+        s.sendall(rest + inner if rest else inner)
+        body = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        assert b"HTTP/1.1 200" in body, body[:200]
+        assert b"app-a" in body or b"instance" in body, body[:300]
+    finally:
+        s.close()
+
+
+def test_h2_upstream(ctx):
+    h2echo = os.path.join(BIN, "eg_h2echo")
+    if not os.path.isfile(h2echo):
+        print("    note: eg_h2echo not built; skipping HTTP/2 upstream test")
+        return
+    port = free_port()
+    admin = free_port()
+    h2_port = free_port()
+    proc_h2 = start("h2echo", [h2echo, "--listen", f"{HOST}:{h2_port}"], h2_port)
+    try:
+        cfg = write_config(
+            "h2-upstream", port, admin,
+            [("h2-app", h2_port, {"http2": "true"})],
+            health_interval_ms=0, max_attempts=1,
+            upstream_response_timeout_ms=3000,
+        )
+        proxy = start_proxy("proxy-h2up", cfg, port, admin)
+        try:
+            # h1 客户端 -> EdgeGate -> h2 上游
+            s = socket.create_connection((HOST, port), timeout=5)
+            try:
+                s.sendall(
+                    f"GET /api/info HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n".encode()
+                )
+                data = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                s.close()
+            assert b"HTTP/1.1 200" in data, data[:300]
+            assert b'"h2":true' in data or b"h2" in data, data[:400]
+
+            body = b"hello-h2-upstream"
+            s = socket.create_connection((HOST, port), timeout=5)
+            try:
+                s.sendall(
+                    f"POST /api/echo HTTP/1.1\r\nHost: {HOST}\r\n"
+                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+                )
+                data = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                s.close()
+            assert b"HTTP/1.1 200" in data, data[:300]
+            assert b'"echo":true' in data or b"bytes" in data, data[:400]
+        finally:
+            proxy.stop()
+    finally:
+        proc_h2.stop()
+
+
+def test_multi_worker(ctx):
+    """num_workers=2：SO_REUSEPORT 双 worker，请求成功，status 含 worker_id。"""
+    port = free_port()
+    admin = free_port()
+    cfg = write_config(
+        "multi-worker", port, admin,
+        [(n, ctx.backend_ports[n]) for n in ctx.names],
+        num_workers=2, health_interval_ms=500,
+    )
+    proc = start_proxy("proxy-mw", cfg, port, admin)
+    try:
+        time.sleep(0.6)
+        for _ in range(20):
+            s = socket.create_connection((HOST, port), timeout=3)
+            try:
+                s.sendall(
+                    f"GET /api/info HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n".encode()
+                )
+                data = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                s.close()
+            assert b"HTTP/1.1 200" in data, data[:200]
+
+        st = json.loads(get_json(admin, "/api/status").body)
+        assert st.get("num_workers") == 2, st
+        assert st.get("worker_id") == 0, st  # 只有 worker 0 有 admin
+        assert "pid" in st
+    finally:
+        proc.stop()
+
+
 def test_graceful_shutdown(ctx):
     code = ctx.proxy_proc.stop()
     assert code in (0, -signal.SIGTERM), f"proxy exited with {code}"
@@ -1189,6 +1363,10 @@ def main():
         ("slow client backpressure", test_backpressure),
         ("timeout + connect failure", test_timeout_and_connect_failure),
         ("retry semantics", test_retry_semantics),
+        ("websocket tunnel", test_websocket_tunnel),
+        ("CONNECT tunnel", test_connect_tunnel),
+        ("HTTP/2 upstream (h2c)", test_h2_upstream),
+        ("multi-worker SO_REUSEPORT", test_multi_worker),
         ("graceful shutdown", test_graceful_shutdown),
     ]
 

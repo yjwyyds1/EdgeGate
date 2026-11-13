@@ -156,6 +156,27 @@ url = 127.0.0.1:9001
                    "1.2 or 1.3");
 }
 
+void test_workers_and_backend_http2() {
+    Config cfg;
+    std::string error;
+    REQUIRE(load_text(R"CONF(
+listen = 127.0.0.1:18080
+num_workers = 4
+[backend a]
+url = 127.0.0.1:9001
+http2 = true
+)CONF",
+                           cfg, error));
+    REQUIRE_EQ(cfg.num_workers, 4);
+    REQUIRE(cfg.backends.size() == 1);
+    REQUIRE(cfg.backends[0].http2);
+    REQUIRE(cfg.summary().find("workers=4") != std::string::npos);
+    REQUIRE(cfg.summary().find("(h2)") != std::string::npos);
+
+    expect_invalid("num_workers = 0\n[backend a]\nurl=127.0.0.1:1\n", "integer");
+    expect_invalid("num_workers = 999\n[backend a]\nurl=127.0.0.1:1\n", "integer");
+}
+
 }  // namespace
 
 int main() {
@@ -164,6 +185,7 @@ int main() {
         test_invalid_configs();
         test_defaults();
         test_tls_config();
+        test_workers_and_backend_http2();
     } catch (const std::exception& e) {
         std::cerr << "config_test failed: " << e.what() << "\n";
         return 1;

@@ -20,6 +20,7 @@ public:
     std::string url() const { return endpoint_.authority(); }
     std::size_t max_connections() const { return max_connections_; }
     std::size_t max_idle() const { return max_idle_; }
+    bool http2() const { return http2_; }
 
     bool healthy() const { return healthy_; }
     bool draining() const { return draining_; }
@@ -50,6 +51,7 @@ private:
     Endpoint endpoint_;
     std::size_t max_connections_ = 128;
     std::size_t max_idle_ = 32;
+    bool http2_ = false;
     int healthy_threshold_ = 2;
     int unhealthy_threshold_ = 3;
     std::int64_t cooldown_ms_ = 5000;

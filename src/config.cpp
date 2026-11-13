@@ -201,6 +201,7 @@ bool Config::load(const std::string& path, Config& out, std::string& error) {
         field = static_cast<int>(parsed);
         return true;
     };
+    if (!take_int("num_workers", out.num_workers, 1, 256)) return false;
     out.max_attempts = 2;
     if (!take_int("max_attempts", out.max_attempts, 1, 10)) return false;
     if (!take_size("retry_body_buffer_bytes", out.retry_body_buffer_bytes, 0, 1u << 30)) return false;
@@ -326,6 +327,13 @@ bool Config::load(const std::string& path, Config& out, std::string& error) {
                 return false;
             }
         }
+        if (local("http2", value)) {
+            if (!parse_bool(value, backend.http2)) {
+                error = "line " + std::to_string(section.line) + ": backend '" + section.name +
+                        "': http2 expects true/false";
+                return false;
+            }
+        }
         for (const auto& [key, value_text] : section.kv) {
             (void)value_text;
             if (!local_used.count(key)) {
@@ -352,13 +360,15 @@ std::string Config::summary() const {
        << " tls=" << (tls_enabled ? tls_listen.authority() : "off")
        << " tls_min=" << tls_min_version << " http2=" << (http2 ? "on" : "off")
        << " balancer=" << balancer
+       << " workers=" << num_workers
        << " backends=" << backends.size() << " max_attempts=" << max_attempts
        << " preserve_host=" << (preserve_host ? "true" : "false")
        << " client_buffer=" << client_buffer_low << "/" << client_buffer_high
        << " upstream_buffer=" << upstream_buffer_low << "/" << upstream_buffer_high
        << " health_interval_ms=" << health_interval_ms;
     for (const BackendConfig& b : backends) {
-        os << " backend[" << b.name << "]=" << b.endpoint.authority();
+        os << " backend[" << b.name << "]=" << b.endpoint.authority()
+           << (b.http2 ? "(h2)" : "");
     }
     return os.str();
 }

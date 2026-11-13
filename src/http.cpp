@@ -661,7 +661,7 @@ std::string last_chunk_frame() { return "0\r\n\r\n"; }
 
 std::string build_request_head(const RequestHead& req, std::string_view upstream_authority,
                                std::string_view client_ip, std::string_view request_id,
-                               bool preserve_host, bool send_chunked) {
+                               bool preserve_host, bool send_chunked, bool websocket_upgrade) {
     std::string out;
     out.reserve(512);
     out += req.method;
@@ -677,13 +677,20 @@ std::string build_request_head(const RequestHead& req, std::string_view upstream
             h.name == "expect" || h.name == "connection" || h.name == "proxy-connection") {
             continue;
         }
+        // WebSocket 升级需要保留 Upgrade 与 Sec-WebSocket-*；普通请求仍过滤 hop-by-hop。
+        if (!websocket_upgrade) {
+            if (h.name == "upgrade") continue;
+            if (is_hop_by_hop(h.name, tokens)) continue;
+        } else if (h.name != "upgrade" && h.name.rfind("sec-websocket-", 0) != 0 &&
+                   is_hop_by_hop(h.name, tokens)) {
+            continue;
+        }
         if (h.name == "x-forwarded-for") {
             had_forwarded_for = true;
             if (!forwarded_for.empty()) forwarded_for += ", ";
             forwarded_for += h.value;
             continue;
         }
-        if (is_hop_by_hop(h.name, tokens)) continue;
         out += canonical_header_name(h.name);
         out += ": ";
         out += h.value;
@@ -711,7 +718,12 @@ std::string build_request_head(const RequestHead& req, std::string_view upstream
     if (!req.host.empty()) out += "X-Forwarded-Host: " + req.host + "\r\n";
     if (!request_id.empty()) out += "X-Request-Id: " + std::string(request_id) + "\r\n";
     out += "Via: 1.1 edgegate\r\n";
-    out += "Connection: keep-alive\r\n";
+    if (websocket_upgrade) {
+        out += "Connection: upgrade\r\n";
+        if (header_value(req.headers, "upgrade").empty()) out += "Upgrade: websocket\r\n";
+    } else {
+        out += "Connection: keep-alive\r\n";
+    }
     out += "\r\n";
     (void)had_forwarded_for;
     return out;
@@ -719,7 +731,8 @@ std::string build_request_head(const RequestHead& req, std::string_view upstream
 
 std::string build_response_head(const ResponseHead& resp, std::string_view upstream_name,
                                 std::string_view request_id, bool client_http10,
-                                bool keep_client_alive, bool send_chunked) {
+                                bool keep_client_alive, bool send_chunked,
+                                bool websocket_upgrade) {
     std::string out;
     out.reserve(512);
     out += client_http10 ? "HTTP/1.0 " : "HTTP/1.1 ";
@@ -734,7 +747,15 @@ std::string build_response_head(const ResponseHead& resp, std::string_view upstr
             h.name == "connection" || h.name == "proxy-connection") {
             continue;
         }
-        if (is_hop_by_hop(h.name, tokens)) continue;
+        if (websocket_upgrade) {
+            // 保留 Upgrade / Sec-WebSocket-Accept 等握手头
+            if (h.name != "upgrade" && h.name.rfind("sec-websocket-", 0) != 0 &&
+                is_hop_by_hop(h.name, tokens)) {
+                continue;
+            }
+        } else if (is_hop_by_hop(h.name, tokens)) {
+            continue;
+        }
         out += canonical_header_name(h.name);
         out += ": ";
         out += h.value;
@@ -747,7 +768,12 @@ std::string build_response_head(const ResponseHead& resp, std::string_view upstr
         out += "Content-Length: " + std::to_string(resp.content_length) + "\r\n";
     }
 
-    out += keep_client_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+    if (websocket_upgrade) {
+        out += "Connection: upgrade\r\n";
+        if (header_value(resp.headers, "upgrade").empty()) out += "Upgrade: websocket\r\n";
+    } else {
+        out += keep_client_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+    }
     out += "Via: 1.1 edgegate\r\n";
     if (!upstream_name.empty()) out += "X-EdgeGate-Upstream: " + std::string(upstream_name) + "\r\n";
     if (!request_id.empty())

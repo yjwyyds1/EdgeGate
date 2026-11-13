@@ -260,7 +260,7 @@ void set_keepalive(int fd) {
     ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 }
 
-int create_listener(const Endpoint& ep, int backlog, std::string& error) {
+int create_listener(const Endpoint& ep, int backlog, std::string& error, bool reuse_port) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -283,6 +283,18 @@ int create_listener(const Endpoint& ep, int backlog, std::string& error) {
         }
         int one = 1;
         ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+        if (reuse_port) {
+            if (::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0) {
+                last_error = "SO_REUSEPORT: " + errno_text(errno);
+                ::close(fd);
+                fd = -1;
+                continue;
+            }
+        }
+#else
+        (void)reuse_port;
+#endif
         if (ai->ai_family == AF_INET6) {
             ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
         }

@@ -178,18 +178,50 @@ struct ProxyServer::Impl::UpstreamConn : EventHandler {
     bool idle = false;
     bool dead = false;
     bool read_paused = false;
+    bool h2_mode = false;
+    bool h2_ready = false;
+    bool h2_handshake_done = false;
+#ifdef EDGEGATE_HAVE_NGHTTP2
+    nghttp2_session* h2c = nullptr;
+    int32_t h2_stream_id = -1;
+    // 上游 h2 响应缓冲（单 stream / 连接）
+    std::string h2_status;
+    std::vector<Header> h2_headers;
+    std::string h2_body;
+    bool h2_headers_done = false;
+    bool h2_body_done = false;
+    bool h2_failed = false;
+    std::string h2_error;
+#endif
     std::int64_t connect_start_ms = 0;
     std::int64_t idle_since_ms = 0;
     std::uint32_t events = 0;
 
-    UpstreamConn(Impl* s, Backend* b) : server(s), backend(b) {}
-    ~UpstreamConn() override = default;
+    UpstreamConn(Impl* s, Backend* b) : server(s), backend(b) {
+        if (b && b->http2()) h2_mode = true;
+    }
+    ~UpstreamConn() override {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+        if (h2c) {
+            nghttp2_session_del(h2c);
+            h2c = nullptr;
+        }
+#endif
+    }
 
     void update_events();
     void on_event(int event_fd, std::uint32_t ev) override;
     void set_read_paused(bool paused);
     void finish_connect();
     void reset_transport();
+    bool start_h2_client(std::string& error);
+    void stop_h2_client();
+    bool h2_submit_request(const RequestHead& req, std::string_view body, std::string_view authority,
+                           std::string_view client_ip, std::string_view request_id, bool preserve_host,
+                           std::string& error);
+    void h2_pump_read();
+    void h2_pump_write();
+    void h2_feed(const std::uint8_t* data, std::size_t len);
 };
 
 struct ProxyServer::Impl::ClientConn : EventHandler, UpstreamOwner {
@@ -200,6 +232,7 @@ struct ProxyServer::Impl::ClientConn : EventHandler, UpstreamOwner {
         SendingBody,
         WaitingResponse,
         StreamingResponse,
+        Tunneling,
         Draining,
         Closing
     };
@@ -254,6 +287,9 @@ struct ProxyServer::Impl::ClientConn : EventHandler, UpstreamOwner {
     bool upstream_paused = false;
     bool request_active = false;
     bool trace_committed = false;
+    bool websocket_upgrade = false;
+    bool connect_tunnel = false;
+    bool tunnel_mode = false;
 
     std::unique_ptr<TlsConnection> tls;
     bool tls_handshaking = false;
@@ -330,6 +366,9 @@ struct ProxyServer::Impl::ClientConn : EventHandler, UpstreamOwner {
     void process_upstream_input();
     void write_client_body(std::string_view data);
     void finish_response();
+    void enter_tunnel(const char* reason);
+    void pump_tunnel_from_client();
+    void pump_tunnel_from_upstream();
     void send_error(int status, std::string_view message);
     void reset_for_next();
     void close_now();
@@ -390,7 +429,7 @@ bool ProxyServer::Impl::init(std::string& error) {
     }
     metrics.healthy_backends.set(static_cast<std::int64_t>(backends.size()));
 
-    listen_fd = create_listener(cfg.listen, 512, error);
+    listen_fd = create_listener(cfg.listen, 512, error, cfg.num_workers > 1);
     if (listen_fd < 0) return false;
     if (!loop.add(listen_fd, EPOLLIN, this)) {
         error = "cannot register listener";
@@ -405,7 +444,7 @@ bool ProxyServer::Impl::init(std::string& error) {
             error = "TLS init failed: " + tls_error;
             return false;
         }
-        tls_listen_fd = create_listener(cfg.tls_listen, 512, error);
+        tls_listen_fd = create_listener(cfg.tls_listen, 512, error, cfg.num_workers > 1);
         if (tls_listen_fd < 0) {
             error = "TLS listener: " + error;
             return false;
@@ -630,6 +669,7 @@ void ProxyServer::Impl::release_upstream(UpstreamConn* up, bool reusable) {
         up->backend->metrics.active_connections.dec();
     }
     const bool can_pool = reusable && !shutting_down && !up->dead && up->backend &&
+                          !up->h2_mode &&
                           static_cast<std::size_t>(up->backend->metrics.idle_connections.value()) <
                               up->backend->max_idle();
     if (can_pool) {
@@ -653,6 +693,7 @@ void ProxyServer::Impl::destroy_upstream(UpstreamConn* up, bool abort) {
     if (!up || up->dead) return;
     up->dead = true;
     up->owner = nullptr;
+    up->stop_h2_client();
     if (up->idle) {
         up->idle = false;
         up->backend->metrics.idle_connections.dec();
@@ -795,8 +836,9 @@ void ProxyServer::Impl::reap() {
 }
 
 int ProxyServer::Impl::run() {
-    log_msg(LogLevel::Info, "edgegate listening on ", cfg.listen.authority(), " admin ",
-            cfg.admin_enabled ? cfg.admin.authority() : "off");
+    log_msg(LogLevel::Info, "edgegate worker ", cfg.worker_id, "/", cfg.num_workers,
+            " pid ", static_cast<long>(::getpid()), " listening on ", cfg.listen.authority(),
+            " admin ", cfg.admin_enabled ? cfg.admin.authority() : "off");
     while (!loop.stopped()) {
         loop.run_once(100);
         reap();
@@ -922,12 +964,16 @@ std::string ProxyServer::Impl::status_json() const {
     const std::int64_t uptime = (now_ms() - start_ms) / 1000;
     std::ostringstream os;
     os << "{"
-       << "\"service\":\"edgegate\",\"version\":\"1.1.0\","
+       << "\"service\":\"edgegate\",\"version\":\"1.3.0\","
        << "\"uptime_seconds\":" << uptime << ","
+       << "\"worker_id\":" << cfg.worker_id << ","
+       << "\"num_workers\":" << cfg.num_workers << ","
+       << "\"pid\":" << static_cast<long>(::getpid()) << ","
        << "\"config\":{"
        << "\"listen\":\"" << json_escape(cfg.listen.authority()) << "\","
        << "\"admin\":\"" << (cfg.admin_enabled ? json_escape(cfg.admin.authority()) : "off")
        << "\",\"balancer\":\"" << json_escape(cfg.balancer) << "\","
+       << "\"num_workers\":" << cfg.num_workers << ","
        << "\"max_attempts\":" << cfg.max_attempts << ","
        << "\"preserve_host\":" << (cfg.preserve_host ? "true" : "false") << ","
        << "\"client_buffer_high\":" << cfg.client_buffer_high << ","
@@ -1023,6 +1069,9 @@ void ProxyServer::Impl::UpstreamConn::update_events() {
     } else if (connected) {
         if (!read_paused) want |= EPOLLIN;
         if (!out.empty()) want |= EPOLLOUT;
+#ifdef EDGEGATE_HAVE_NGHTTP2
+        if (h2c && nghttp2_session_want_write(h2c)) want |= EPOLLOUT;
+#endif
     }
     if (want != events) {
         events = want;
@@ -1047,8 +1096,22 @@ void ProxyServer::Impl::UpstreamConn::finish_connect() {
     }
     connecting = false;
     connected = true;
+    if (h2_mode) {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+        std::string why;
+        if (!start_h2_client(why)) {
+            if (owner) owner->on_upstream_failure(why.empty() ? "h2 client init failed" : why, true, 502);
+            return;
+        }
+#else
+        if (owner) {
+            owner->on_upstream_failure("backend http2=true but EdgeGate built without nghttp2", true, 502);
+        }
+        return;
+#endif
+    }
     update_events();
-    log_msg(LogLevel::Debug, "upstream fd ", fd, " connected");
+    log_msg(LogLevel::Debug, "upstream fd ", fd, " connected", h2_mode ? " (h2)" : "");
     if (owner) owner->on_upstream_ready();
 }
 
@@ -1068,10 +1131,19 @@ void ProxyServer::Impl::UpstreamConn::on_event(int event_fd, std::uint32_t ev) {
         return;
     }
     if (ev & EPOLLOUT) {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+        if (h2_mode && h2c) h2_pump_write();
+#endif
         if (owner) owner->on_upstream_writable();
         if (dead || !owner) return;
     }
     if (ev & EPOLLIN) {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+        if (h2_mode && h2c) {
+            h2_pump_read();
+            if (dead) return;
+        }
+#endif
         if (owner) owner->on_upstream_readable();
         if (dead || !owner) return;
     }
@@ -1084,6 +1156,352 @@ void ProxyServer::Impl::UpstreamConn::reset_transport() {
     in.clear();
     out.clear();
     events = 0;
+    stop_h2_client();
+    if (backend && backend->http2()) h2_mode = true;
+    else h2_mode = false;
+    h2_ready = false;
+    h2_handshake_done = false;
+}
+
+void ProxyServer::Impl::UpstreamConn::stop_h2_client() {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+    if (h2c) {
+        nghttp2_session_del(h2c);
+        h2c = nullptr;
+    }
+    h2_stream_id = -1;
+    h2_status.clear();
+    h2_headers.clear();
+    h2_body.clear();
+    h2_headers_done = false;
+    h2_body_done = false;
+    h2_failed = false;
+    h2_error.clear();
+#endif
+    h2_ready = false;
+}
+
+bool ProxyServer::Impl::UpstreamConn::start_h2_client(std::string& error) {
+#ifndef EDGEGATE_HAVE_NGHTTP2
+    error = "nghttp2 not available";
+    return false;
+#else
+    stop_h2_client();
+    h2_mode = true;
+    nghttp2_session_callbacks* callbacks = nullptr;
+    if (nghttp2_session_callbacks_new(&callbacks) != 0 || !callbacks) {
+        error = "nghttp2_session_callbacks_new failed";
+        return false;
+    }
+
+    nghttp2_session_callbacks_set_on_header_callback(
+        callbacks,
+        [](nghttp2_session*, const nghttp2_frame* frame, const uint8_t* name, size_t namelen,
+           const uint8_t* value, size_t valuelen, uint8_t, void* user_data) -> int {
+            auto* self = static_cast<UpstreamConn*>(user_data);
+            if (!self || frame->hd.type != NGHTTP2_HEADERS) return 0;
+            if (frame->headers.cat != NGHTTP2_HCAT_RESPONSE &&
+                frame->headers.cat != NGHTTP2_HCAT_HEADERS) {
+                return 0;
+            }
+            std::string n(reinterpret_cast<const char*>(name), namelen);
+            std::string v(reinterpret_cast<const char*>(value), valuelen);
+            if (n == ":status") {
+                self->h2_status = std::move(v);
+            } else if (!n.empty() && n[0] != ':') {
+                Header h;
+                h.name = to_lower(n);
+                h.value = std::move(v);
+                self->h2_headers.push_back(std::move(h));
+            }
+            return 0;
+        });
+
+    nghttp2_session_callbacks_set_on_frame_recv_callback(
+        callbacks,
+        [](nghttp2_session*, const nghttp2_frame* frame, void* user_data) -> int {
+            auto* self = static_cast<UpstreamConn*>(user_data);
+            if (!self) return 0;
+            if (frame->hd.type == NGHTTP2_HEADERS &&
+                (frame->headers.cat == NGHTTP2_HCAT_RESPONSE ||
+                 frame->headers.cat == NGHTTP2_HCAT_HEADERS) &&
+                (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
+                if (!self->h2_headers_done) {
+                    self->h2_headers_done = true;
+                    // 把 h2 响应头转成 HTTP/1.1，复用现有解析路径
+                    std::string synthetic;
+                    synthetic.reserve(256);
+                    synthetic += "HTTP/1.1 ";
+                    synthetic += self->h2_status.empty() ? "200" : self->h2_status;
+                    synthetic += " OK\r\n";
+                    bool has_cl = false;
+                    for (const Header& h : self->h2_headers) {
+                        if (h.name == "connection" || h.name == "transfer-encoding") continue;
+                        if (h.name == "content-length") has_cl = true;
+                        synthetic += h.name;
+                        synthetic += ": ";
+                        synthetic += h.value;
+                        synthetic += "\r\n";
+                    }
+                    if (!has_cl && !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                        // 流式 body：用 close-delimited（响应结束时 upstream eof）
+                    }
+                    synthetic += "Connection: close\r\n\r\n";
+                    self->in.append(synthetic);
+                }
+                if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+                    self->h2_body_done = true;
+                }
+            }
+            if (frame->hd.type == NGHTTP2_DATA && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                self->h2_body_done = true;
+            }
+            return 0;
+        });
+
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
+        callbacks,
+        [](nghttp2_session*, uint8_t, int32_t, const uint8_t* data, size_t len,
+           void* user_data) -> int {
+            auto* self = static_cast<UpstreamConn*>(user_data);
+            if (!self || len == 0) return 0;
+            self->in.append(reinterpret_cast<const char*>(data), len);
+            return 0;
+        });
+
+    nghttp2_session_callbacks_set_on_stream_close_callback(
+        callbacks,
+        [](nghttp2_session*, int32_t, uint32_t error_code, void* user_data) -> int {
+            auto* self = static_cast<UpstreamConn*>(user_data);
+            if (!self) return 0;
+            self->h2_body_done = true;
+            if (error_code != NGHTTP2_NO_ERROR) {
+                self->h2_failed = true;
+                self->h2_error = "upstream h2 stream error " + std::to_string(error_code);
+            }
+            return 0;
+        });
+
+    const int rc = nghttp2_session_client_new2(&h2c, callbacks, this, nullptr);
+    nghttp2_session_callbacks_del(callbacks);
+    if (rc != 0 || !h2c) {
+        error = "nghttp2_session_client_new2 failed";
+        return false;
+    }
+
+    nghttp2_settings_entry settings[] = {
+        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 1},
+        {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1u << 20},
+    };
+    if (nghttp2_submit_settings(h2c, NGHTTP2_FLAG_NONE, settings, 2) != 0) {
+        error = "nghttp2_submit_settings failed";
+        stop_h2_client();
+        return false;
+    }
+
+    // prior knowledge：先写 client connection preface
+    static const char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    out.append(kPreface, sizeof(kPreface) - 1);
+    h2_pump_write();
+    h2_ready = true;
+    h2_handshake_done = true;
+    return true;
+#endif
+}
+
+bool ProxyServer::Impl::UpstreamConn::h2_submit_request(const RequestHead& req,
+                                                         std::string_view body,
+                                                         std::string_view authority,
+                                                         std::string_view client_ip,
+                                                         std::string_view request_id,
+                                                         bool preserve_host, std::string& error) {
+#ifndef EDGEGATE_HAVE_NGHTTP2
+    (void)req;
+    (void)body;
+    (void)authority;
+    (void)client_ip;
+    (void)request_id;
+    (void)preserve_host;
+    error = "nghttp2 not available";
+    return false;
+#else
+    if (!h2c) {
+        error = "h2 client session missing";
+        return false;
+    }
+    h2_status.clear();
+    h2_headers.clear();
+    h2_body.clear();
+    h2_headers_done = false;
+    h2_body_done = false;
+    h2_failed = false;
+    h2_error.clear();
+    in.clear();
+
+    std::vector<std::string> store;
+    store.reserve(16);
+    auto add = [&](std::string n, std::string v) {
+        store.push_back(std::move(n));
+        store.push_back(std::move(v));
+    };
+    add(":method", req.method);
+    add(":path", req.target.empty() ? "/" : req.target);
+    add(":scheme", "http");
+    add(":authority", preserve_host && !req.host.empty() ? req.host : std::string(authority));
+
+    for (const Header& h : req.headers) {
+        if (h.name == "host" || h.name == "connection" || h.name == "keep-alive" ||
+            h.name == "proxy-connection" || h.name == "transfer-encoding" || h.name == "upgrade" ||
+            h.name == "te" || h.name == "trailer" || h.name == "content-length") {
+            continue;
+        }
+        add(h.name, h.value);
+    }
+    if (!body.empty() || req.has_content_length) {
+        add("content-length", std::to_string(body.size()));
+    }
+    add("x-forwarded-for", std::string(client_ip));
+    add("x-forwarded-proto", "http");
+    if (!request_id.empty()) add("x-request-id", std::string(request_id));
+    add("via", "1.1 edgegate");
+
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(store.size() / 2);
+    for (std::size_t i = 0; i + 1 < store.size(); i += 2) {
+        nghttp2_nv nv{};
+        nv.name = reinterpret_cast<uint8_t*>(store[i].data());
+        nv.value = reinterpret_cast<uint8_t*>(store[i + 1].data());
+        nv.namelen = store[i].size();
+        nv.valuelen = store[i + 1].size();
+        nv.flags = NGHTTP2_NV_FLAG_NONE;
+        nva.push_back(nv);
+    }
+
+    nghttp2_data_provider2 provider{};
+    std::string* body_holder = nullptr;
+    if (!body.empty()) {
+        body_holder = new std::string(body);
+        provider.source.ptr = body_holder;
+        provider.read_callback = [](nghttp2_session*, int32_t, uint8_t* buf, size_t length,
+                                    uint32_t* data_flags, nghttp2_data_source* source,
+                                    void*) -> nghttp2_ssize {
+            auto* s = static_cast<std::string*>(source->ptr);
+            if (!s || s->empty()) {
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                return 0;
+            }
+            const size_t n = std::min(length, s->size());
+            std::memcpy(buf, s->data(), n);
+            s->erase(0, n);
+            if (s->empty()) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            return static_cast<nghttp2_ssize>(n);
+        };
+    }
+
+    const int32_t sid =
+        nghttp2_submit_request2(h2c, nullptr, nva.data(), nva.size(),
+                                body.empty() ? nullptr : &provider, this);
+    if (body_holder && sid < 0) delete body_holder;
+    if (sid < 0) {
+        error = "nghttp2_submit_request2 failed";
+        if (body_holder) delete body_holder;
+        return false;
+    }
+    h2_stream_id = sid;
+    // 把 body_holder 挂到 stream user data 以便结束后释放
+    if (body_holder) {
+        nghttp2_session_set_stream_user_data(h2c, sid, body_holder);
+    }
+    h2_pump_write();
+    update_events();
+    return true;
+#endif
+}
+
+void ProxyServer::Impl::UpstreamConn::h2_pump_write() {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+    if (!h2c || dead) return;
+    for (;;) {
+        const uint8_t* data = nullptr;
+        const ssize_t n = nghttp2_session_mem_send(h2c, &data);
+        if (n < 0) {
+            h2_failed = true;
+            h2_error = "nghttp2_session_mem_send failed";
+            return;
+        }
+        if (n == 0) break;
+        out.append(reinterpret_cast<const char*>(data), static_cast<std::size_t>(n));
+    }
+    while (!out.empty()) {
+        const ssize_t n = ::send(fd, out.data(), out.size(), MSG_NOSIGNAL);
+        if (n > 0) {
+            out.consume(static_cast<std::size_t>(n));
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else if (n < 0 && eagain(errno)) {
+            break;
+        } else {
+            h2_failed = true;
+            h2_error = std::string("upstream h2 write: ") + std::strerror(errno);
+            return;
+        }
+    }
+    update_events();
+#endif
+}
+
+void ProxyServer::Impl::UpstreamConn::h2_pump_read() {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+    if (!h2c || dead || read_paused) return;
+    char buf[kRecvChunk];
+    for (;;) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            h2_feed(reinterpret_cast<const uint8_t*>(buf), static_cast<std::size_t>(n));
+            if (h2_failed) {
+                if (owner) owner->on_upstream_failure(h2_error, false, 502);
+                return;
+            }
+            continue;
+        }
+        if (n == 0) {
+            if (owner) owner->on_upstream_eof();
+            return;
+        }
+        if (errno == EINTR) continue;
+        if (eagain(errno)) break;
+        if (owner) {
+            owner->on_upstream_failure(std::string("upstream h2 read: ") + std::strerror(errno), false,
+                                       502);
+        }
+        return;
+    }
+    h2_pump_write();
+    update_events();
+#endif
+}
+
+void ProxyServer::Impl::UpstreamConn::h2_feed(const std::uint8_t* data, std::size_t len) {
+#ifdef EDGEGATE_HAVE_NGHTTP2
+    if (!h2c) return;
+    const ssize_t rv = nghttp2_session_mem_recv(h2c, data, len);
+    if (rv < 0) {
+        h2_failed = true;
+        h2_error = "nghttp2_session_mem_recv failed";
+        return;
+    }
+    // 释放已结束 stream 的 body holder
+    if (h2_stream_id > 0 && h2_body_done) {
+        void* ud = nghttp2_session_get_stream_user_data(h2c, h2_stream_id);
+        if (ud) {
+            delete static_cast<std::string*>(ud);
+            nghttp2_session_set_stream_user_data(h2c, h2_stream_id, nullptr);
+        }
+    }
+#else
+    (void)data;
+    (void)len;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1623,7 @@ void ProxyServer::Impl::ClientConn::on_event(int event_fd, std::uint32_t ev) {
 
 bool ProxyServer::Impl::ClientConn::read_allowed() const {
     if (closed || client_eof || client_paused) return false;
+    if (state == State::Tunneling) return true;
     if (state == State::ReadRequest) return out.empty();
     if (state == State::SendingBody) return !req_body_done;
     return false;
@@ -1265,7 +1684,7 @@ void ProxyServer::Impl::ClientConn::set_upstream_paused(bool paused, bool count)
 void ProxyServer::Impl::ClientConn::maybe_resume_upstream() {
     if (!upstream_paused || !up) return;
     if (server->global_backpressure) return;
-    if (out.size() < server->cfg.client_buffer_low && !response_complete) {
+    if (out.size() < server->cfg.client_buffer_low && (!response_complete || tunnel_mode)) {
         set_upstream_paused(false, true);
     }
 }
@@ -1275,6 +1694,10 @@ void ProxyServer::Impl::ClientConn::on_readable() {
     if (h2_mode) {
         if (h2) h2->on_readable();
         if (close_requested) close_now();
+        return;
+    }
+    if (tunnel_mode) {
+        pump_tunnel_from_client();
         return;
     }
     io_want_read = false;
@@ -1386,9 +1809,17 @@ void ProxyServer::Impl::ClientConn::handle_input() {
         if (req.chunked) server->metrics.chunked_requests.inc();
         start_trace();
 
-        if (iequals(req.method, "CONNECT") || req.upgrade) {
-            send_error(501, "CONNECT and protocol upgrades are not supported in v1");
-            return;
+        if (iequals(req.method, "CONNECT")) {
+            connect_tunnel = true;
+            websocket_upgrade = false;
+        } else if (req.upgrade) {
+            const std::string upg = header_value(req.headers, "upgrade");
+            if (!iequals(upg, "websocket")) {
+                send_error(501, "only websocket upgrades are supported");
+                return;
+            }
+            websocket_upgrade = true;
+            connect_tunnel = false;
         }
         if (server->cfg.max_request_body_bytes > 0 && req.has_content_length &&
             req.content_length > server->cfg.max_request_body_bytes) {
@@ -1396,7 +1827,7 @@ void ProxyServer::Impl::ClientConn::handle_input() {
             return;
         }
 
-        if (req.expect_continue) {
+        if (req.expect_continue && !websocket_upgrade && !connect_tunnel) {
             out.append("HTTP/1.1 100 Continue\r\n\r\n");
             sent_100 = true;
         }
@@ -1482,10 +1913,56 @@ void ProxyServer::Impl::ClientConn::on_upstream_ready() {
     up->connecting = false;
     up->update_events();
 
+    // CONNECT：TCP 建连成功后直接回 200，进入双向隧道，不再向后端发 HTTP。
+    if (connect_tunnel) {
+        std::string head = "HTTP/1.1 200 Connection Established\r\n";
+        head += "Via: 1.1 edgegate\r\n";
+        head += "X-EdgeGate-Upstream: " + backend->name() + "\r\n";
+        head += "X-EdgeGate-Request-Id: " + request_id + "\r\n\r\n";
+        out.append(head);
+        response_status = 200;
+        response_started = true;
+        resp_head_done = true;
+        last_out_progress_ms = now;
+        enter_tunnel("CONNECT tunnel established");
+        return;
+    }
+
+    if (up->h2_mode) {
+        if (websocket_upgrade) {
+            on_upstream_failure("websocket upgrade cannot use HTTP/2 upstream", false, 502);
+            return;
+        }
+        if (req_body_mode == BodyMode::None) req_body_done = true;
+        if (!req_body_done) {
+            // 先把 body 收进 replay_body，完成后再 h2_submit_request
+            state = State::SendingBody;
+            set_client_paused(false, false);
+            update_events();
+            pump_request_body();
+            return;
+        }
+        std::string why;
+        if (!up->h2_submit_request(req, replay_body, backend->endpoint().authority(), client_ip,
+                                   request_id, server->cfg.preserve_host, why)) {
+            on_upstream_failure(why.empty() ? "h2 upstream submit failed" : why, false, 502);
+            return;
+        }
+        any_request_bytes_written = true;
+        state = State::WaitingResponse;
+        request_sent_ms = now;
+        update_events();
+        up->update_events();
+        // 若响应已在 in 中（极少见），立刻处理
+        if (!up->in.empty()) on_upstream_readable();
+        return;
+    }
+
     if (req_body_mode == BodyMode::None) req_body_done = true;
-    const bool send_chunked = req.chunked;
+    const bool send_chunked = req.chunked && !websocket_upgrade;
     std::string head = build_request_head(req, backend->endpoint().authority(), client_ip,
-                                          request_id, server->cfg.preserve_host, send_chunked);
+                                          request_id, server->cfg.preserve_host, send_chunked,
+                                          websocket_upgrade);
     up->out.append(head);
     up->update_events();
 
@@ -1518,6 +1995,15 @@ void ProxyServer::Impl::ClientConn::capture_replay(std::string_view data) {
 
 void ProxyServer::Impl::ClientConn::queue_upstream_body(std::string_view data, bool frame_chunked) {
     if (!up) return;
+    // h2 上游：body 只进 replay 缓冲，等完整后再 submit
+    if (up->h2_mode) {
+        body_forwarded = true;
+        bytes_in += data.size();
+        backend->metrics.bytes_in.inc(data.size());
+        server->metrics.bytes_in_total.inc(data.size());
+        capture_replay(data);
+        return;
+    }
     if (frame_chunked) up->out.append(chunk_frame(data));
     else up->out.append(data.data(), data.size());
     body_forwarded = true;
@@ -1563,7 +2049,19 @@ void ProxyServer::Impl::ClientConn::pump_request_body() {
                 return;
             }
             if (st == ChunkedDecoder::Status::Done) {
-                if (up) up->out.append(last_chunk_frame());
+                if (up && up->h2_mode) {
+                    std::string why;
+                    if (!up->h2_submit_request(req, replay_body, backend->endpoint().authority(),
+                                               client_ip, request_id, server->cfg.preserve_host,
+                                               why)) {
+                        on_upstream_failure(why.empty() ? "h2 upstream submit failed" : why, false,
+                                            502);
+                        return;
+                    }
+                    any_request_bytes_written = true;
+                } else if (up) {
+                    up->out.append(last_chunk_frame());
+                }
                 req_body_done = true;
                 state = State::WaitingResponse;
                 request_sent_ms = now_ms();
@@ -1607,6 +2105,15 @@ void ProxyServer::Impl::ClientConn::pump_request_body() {
             }
         }
         if (req_body_remaining == 0) {
+            if (up && up->h2_mode) {
+                std::string why;
+                if (!up->h2_submit_request(req, replay_body, backend->endpoint().authority(),
+                                           client_ip, request_id, server->cfg.preserve_host, why)) {
+                    on_upstream_failure(why.empty() ? "h2 upstream submit failed" : why, false, 502);
+                    return;
+                }
+                any_request_bytes_written = true;
+            }
             req_body_done = true;
             state = State::WaitingResponse;
             request_sent_ms = now_ms();
@@ -1661,6 +2168,31 @@ void ProxyServer::Impl::ClientConn::flush_upstream_out() {
 
 void ProxyServer::Impl::ClientConn::on_upstream_readable() {
     if (closed || !up || up->connecting) return;
+    if (tunnel_mode) {
+        pump_tunnel_from_upstream();
+        return;
+    }
+    if (up->h2_mode) {
+        if (up->h2_failed) {
+            on_upstream_failure(up->h2_error.empty() ? "upstream h2 failed" : up->h2_error, false, 502);
+            return;
+        }
+        // h2_pump_read 可能已在 on_event 里调用；这里消费 in
+        process_upstream_input();
+        if (closed || !up) return;
+        if (up->h2_body_done && up->in.empty()) {
+            if (!resp_head_done) {
+                on_upstream_failure("upstream h2 closed before response", false, 502);
+                return;
+            }
+            if (resp_body_mode == BodyMode::UntilClose || !response_complete) {
+                on_upstream_eof();
+                return;
+            }
+        }
+        if (up) up->update_events();
+        return;
+    }
     if (server->global_backpressure && out.size() > server->cfg.client_buffer_low) {
         set_upstream_paused(true, true);
         return;
@@ -1770,6 +2302,28 @@ void ProxyServer::Impl::ClientConn::process_upstream_input() {
                 !no_body && !resp.has_content_length && !client_chunked_response;
             if (close_delimited) keep_client_alive = false;
 
+            if (resp.status == 101) {
+                if (!websocket_upgrade) {
+                    on_upstream_failure("unexpected 101 Switching Protocols", false, 502);
+                    return;
+                }
+                keep_client_alive = false;
+                const std::string head = build_response_head(resp, backend->name(), request_id,
+                                                             req.http10, false, false, true);
+                out.append(head);
+                last_out_progress_ms = now_ms();
+                if (resp.chunked) server->metrics.chunked_responses.inc();
+                trace.chunked_response = resp.chunked;
+                if (!up->in.empty()) {
+                    out.append(up->in.view());
+                    bytes_out += up->in.size();
+                    up->in.clear();
+                }
+                update_events();
+                enter_tunnel("websocket upgrade");
+                return;
+            }
+
             const std::string head = build_response_head(resp, backend->name(), request_id,
                                                          req.http10, keep_client_alive,
                                                          client_chunked_response);
@@ -1779,13 +2333,6 @@ void ProxyServer::Impl::ClientConn::process_upstream_input() {
             trace.chunked_response = resp.chunked;
             update_events();
 
-            if (resp.status == 101) {
-                keep_client_alive = false;
-                close_after_flush = true;
-                state = State::StreamingResponse;
-                finish_response();
-                return;
-            }
             if (no_body) {
                 state = State::StreamingResponse;
                 finish_response();
@@ -1860,6 +2407,136 @@ void ProxyServer::Impl::ClientConn::write_client_body(std::string_view data) {
     else if (upstream_paused && out.size() < server->cfg.client_buffer_low) {
         set_upstream_paused(false, true);
     }
+}
+
+void ProxyServer::Impl::ClientConn::enter_tunnel(const char* reason) {
+    tunnel_mode = true;
+    state = State::Tunneling;
+    keep_client_alive = false;
+    close_after_flush = false;
+    response_complete = false;
+    req_body_done = true;
+    set_client_paused(false, false);
+    set_upstream_paused(false, false);
+    if (up) {
+        up->read_paused = false;
+        up->update_events();
+    }
+    log_msg(LogLevel::Info, "tunnel mode from ", client_ip, " via ",
+            backend ? backend->name() : "?", ": ", reason ? reason : "");
+    // 提交一次 trace（隧道随后的字节计入 bytes_in/out，结束时再更新）
+    if (!trace_committed) {
+        trace.status = response_status ? response_status : 101;
+        trace.ttfb_ms = ttfb_ms;
+        trace.connect_ms = connect_ms;
+        // 隧道结束时再 commit；这里只标记 response 已开始
+    }
+    update_events();
+    flush_client_out();
+    if (closed) return;
+    flush_upstream_out();
+    if (!in.empty()) pump_tunnel_from_client();
+}
+
+void ProxyServer::Impl::ClientConn::pump_tunnel_from_client() {
+    if (closed || !tunnel_mode || !up) return;
+    // 把客户端 in 缓冲写入上游 out
+    if (!in.empty()) {
+        up->out.append(in.view());
+        bytes_in += in.size();
+        if (backend) backend->metrics.bytes_in.inc(in.size());
+        server->metrics.bytes_in_total.inc(in.size());
+        in.clear();
+        flush_upstream_out();
+        if (closed) return;
+    }
+    if (up && up->out.size() >= server->cfg.upstream_buffer_high) {
+        set_client_paused(true, true);
+    } else {
+        set_client_paused(false, false);
+    }
+    // 继续从客户端 socket 读
+    char buf[kRecvChunk];
+    for (;;) {
+        if (client_paused || closed) break;
+        if (up && up->out.size() >= server->cfg.upstream_buffer_high) {
+            set_client_paused(true, true);
+            break;
+        }
+        std::size_t got = 0;
+        const IoStatus st = client_read(buf, sizeof(buf), got);
+        if (st == IoStatus::Ok && got > 0) {
+            last_activity_ms = now_ms();
+            up->out.append(buf, got);
+            bytes_in += got;
+            if (backend) backend->metrics.bytes_in.inc(got);
+            server->metrics.bytes_in_total.inc(got);
+            flush_upstream_out();
+            if (closed) return;
+            continue;
+        }
+        if (st == IoStatus::WantRead) break;
+        if (st == IoStatus::WantWrite) {
+            io_want_write = true;
+            break;
+        }
+        if (st == IoStatus::Eof) {
+            // 客户端半关闭：排空上游写缓冲后关闭
+            client_eof = true;
+            if (up && up->out.empty()) close_now();
+            else update_events();
+            return;
+        }
+        close_now();
+        return;
+    }
+    update_events();
+}
+
+void ProxyServer::Impl::ClientConn::pump_tunnel_from_upstream() {
+    if (closed || !tunnel_mode || !up) return;
+    if (out.size() >= server->cfg.client_buffer_high) {
+        set_upstream_paused(true, true);
+        return;
+    }
+    char buf[kRecvChunk];
+    for (;;) {
+        if (upstream_paused || closed || !up) break;
+        const ssize_t n = ::recv(up->fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            last_activity_ms = now_ms();
+            out.append(buf, static_cast<std::size_t>(n));
+            bytes_out += static_cast<std::uint64_t>(n);
+            if (backend) backend->metrics.bytes_out.inc(static_cast<std::uint64_t>(n));
+            server->metrics.bytes_out_total.inc(static_cast<std::uint64_t>(n));
+            flush_client_out();
+            if (closed) return;
+            if (out.size() >= server->cfg.client_buffer_high) {
+                set_upstream_paused(true, true);
+                break;
+            }
+            continue;
+        }
+        if (n == 0) {
+            // 上游关闭：排空客户端写缓冲后结束
+            if (out.empty()) close_now();
+            else {
+                close_after_flush = true;
+                if (up) {
+                    server->destroy_upstream(up, false);
+                    up = nullptr;
+                }
+                update_events();
+            }
+            return;
+        }
+        if (errno == EINTR) continue;
+        if (eagain(errno)) break;
+        close_now();
+        return;
+    }
+    if (up) up->update_events();
+    update_events();
 }
 
 void ProxyServer::Impl::ClientConn::finish_response() {
@@ -1944,6 +2621,9 @@ void ProxyServer::Impl::ClientConn::reset_for_next() {
     upstream_paused = false;
     request_active = false;
     trace_committed = false;
+    websocket_upgrade = false;
+    connect_tunnel = false;
+    tunnel_mode = false;
     request_started_ms = 0;
     request_sent_ms = 0;
     connect_start_ms = 0;
@@ -2022,9 +2702,19 @@ void ProxyServer::Impl::ClientConn::send_error(int status, std::string_view mess
 void ProxyServer::Impl::ClientConn::close_now() {
     if (closed) return;
     closed = true;
-    if (request_active) {
-        trace.status = response_status;
-        commit_trace("client_closed");
+    if (request_active || tunnel_mode) {
+        if (tunnel_mode) {
+            const std::int64_t now = now_ms();
+            trace.duration_ms = request_started_ms ? static_cast<double>(now - request_started_ms) : 0;
+            trace.bytes_in = bytes_in;
+            trace.bytes_out = bytes_out;
+            trace.status = response_status ? response_status : (connect_tunnel ? 200 : 101);
+            if (backend) backend->metrics.latency_ms.observe(trace.duration_ms);
+            server->metrics.request_duration_ms.observe(trace.duration_ms);
+            if (!trace_committed) server->metrics.responses_total.inc();
+        }
+        trace.status = response_status ? response_status : trace.status;
+        commit_trace(tunnel_mode ? "tunnel_closed" : "client_closed");
     }
     if (up) {
         up->owner = nullptr;
@@ -2055,6 +2745,13 @@ void ProxyServer::Impl::ClientConn::on_client_eof() {
     }
     client_eof = true;
     set_client_paused(true, false);
+    if (tunnel_mode) {
+        // 客户端半关闭：尽量把上游写缓冲排空再关
+        if (up) flush_upstream_out();
+        if (!up || up->out.empty()) close_now();
+        else update_events();
+        return;
+    }
     if (state == State::ReadRequest || (state == State::SendingBody && !req_body_done)) {
         close_now();
         return;

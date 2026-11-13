@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(EdgeGate VERSION 1.1.0 LANGUAGES CXX)
+project(EdgeGate VERSION 1.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,6 +58,12 @@ target_link_libraries(eg_demo PRIVATE edgegate_core)
 
 add_executable(eg_loadgen apps/eg_loadgen.cpp)
 target_link_libraries(eg_loadgen PRIVATE edgegate_core)
+
+if(EDGEGATE_HAVE_NGHTTP2)
+    add_executable(eg_h2echo apps/eg_h2echo.cpp)
+    target_link_libraries(eg_h2echo PRIVATE edgegate_core)
+    target_compile_options(eg_h2echo PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

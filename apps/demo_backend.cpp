@@ -37,6 +37,7 @@ extern "C" {
 struct evp_md_ctx_st;
 struct evp_md_st;
 const evp_md_st* EVP_sha256();
+const evp_md_st* EVP_sha1();
 evp_md_ctx_st* EVP_MD_CTX_new();
 void EVP_MD_CTX_free(evp_md_ctx_st*);
 int EVP_DigestInit_ex(evp_md_ctx_st*, const evp_md_st*, void*);
@@ -474,6 +475,7 @@ std::string index_html() {
            "<li><code>GET /api/whoami</code> 需要 <code>Authorization: Bearer &lt;token&gt;</code></li>"
            "<li><code>GET /files/&lt;name&gt;</code> 下载 <code>--root</code> 中的文件</li>"
            "<li><code>PUT /uploads/&lt;name&gt;</code> 上传文件，返回 SHA-256</li>"
+           "<li><code>GET /api/ws</code> WebSocket 升级后原始字节回显（隧道测试）</li>"
            "<li><code>GET /api/delay?ms=1000</code> 延迟响应</li>"
            "</ul></body></html>";
 }
@@ -529,6 +531,62 @@ void route(int fd, Buffer& in, const RequestHead& req, std::string_view query, b
                                  ",\"sha256\":\"" + hash.hex() + "\"}";
         send_json(fd, 200, body, keep_alive, head);
         return;
+    }
+    if (path == "/api/ws" && (req.method == "GET" || head)) {
+        // 最小 WebSocket 握手 + 原始字节回显（非完整帧解析，专供代理隧道测试）
+        if (!eg::iequals(eg::header_value(req.headers, "upgrade"), "websocket")) {
+            send_json(fd, 400, json_error("Upgrade: websocket required"), keep_alive, head);
+            return;
+        }
+        const std::string key = eg::header_value(req.headers, "sec-websocket-key");
+        if (key.empty()) {
+            send_json(fd, 400, json_error("Sec-WebSocket-Key required"), keep_alive, head);
+            return;
+        }
+        const std::string accept_src = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        unsigned char md[20];
+        unsigned int md_len = 0;
+        evp_md_ctx_st* ctx = EVP_MD_CTX_new();
+        if (!ctx || !EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) ||
+            !EVP_DigestUpdate(ctx, accept_src.data(), accept_src.size()) ||
+            !EVP_DigestFinal_ex(ctx, md, &md_len)) {
+            if (ctx) EVP_MD_CTX_free(ctx);
+            send_json(fd, 500, json_error("sha1 failed"), keep_alive, head);
+            return;
+        }
+        EVP_MD_CTX_free(ctx);
+        static const char* b64 =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string accept;
+        accept.reserve(28);
+        for (unsigned i = 0; i < md_len; i += 3) {
+            const unsigned v = (md[i] << 16) |
+                               ((i + 1 < md_len ? md[i + 1] : 0) << 8) |
+                               (i + 2 < md_len ? md[i + 2] : 0);
+            accept.push_back(b64[(v >> 18) & 63]);
+            accept.push_back(b64[(v >> 12) & 63]);
+            accept.push_back(i + 1 < md_len ? b64[(v >> 6) & 63] : '=');
+            accept.push_back(i + 2 < md_len ? b64[v & 63] : '=');
+        }
+        std::string out = "HTTP/1.1 101 Switching Protocols\r\n";
+        out += "Upgrade: websocket\r\n";
+        out += "Connection: Upgrade\r\n";
+        out += "Sec-WebSocket-Accept: " + accept + "\r\n";
+        out += "X-Backend: " + g_options.name + "\r\n\r\n";
+        if (!send_all(fd, out)) return;
+        close_after = true;
+        // 原始回显：读什么写什么，直到对端关闭
+        char buf[4096];
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n > 0) {
+                if (!send_all(fd, std::string_view(buf, static_cast<std::size_t>(n)))) return;
+                continue;
+            }
+            if (n == 0) return;
+            if (errno == EINTR) continue;
+            return;
+        }
     }
     if (path == "/api/login" && req.method == "POST") {
         int body_status = 0;

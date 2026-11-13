@@ -154,18 +154,65 @@ curl -k --http2 --parallel \
 
 `buffered_bytes` 额外包含 H2Session 的 `out`、每个 stream 的 `pending` 和请求 body。
 
+## 上游 HTTP/2（v1.2）
+
+v1.2 支持把请求转到 **h2c prior-knowledge** 上游：
+
+```ini
+[backend app-h2]
+url = http://127.0.0.1:9401
+http2 = true
+```
+
+路径：
+
+```text
+客户端 h1 或 h2
+    → EdgeGate
+        → UpstreamConn（nghttp2 client + connection preface）
+            → 上游 h2c
+```
+
+实现要点：
+
+- `UpstreamConn` 在 `backend.http2=true` 时建立 nghttp2 **client** session；
+- 连接成功后先发 `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`，再 SETTINGS；
+- `h2_submit_request()` 把 `RequestHead` 映射为 `:method/:path/:authority`；
+- 上游响应通过回调组装成合成的 HTTP/1.1 字节流写入 `up->in`，复用现有 `ResponseHeadParser`；
+- 当前每个上游连接一次只跑一个 stream，响应结束后不放回 idle 池（实现简单，避免 session 复用状态纠缠）；
+- 上游 TLS（`https://`）和真正的多路复用连接池是后续工作。
+
+本地验证：
+
+```bash
+./build/eg_h2echo --listen 127.0.0.1:9401 &
+# config 中 backend http2=true 指向 9401
+./build/edgegate --config ...
+curl -s http://127.0.0.1:8080/api/info
+```
+
+## WebSocket / CONNECT 隧道（v1.2）
+
+HTTP/1.1 客户端：
+
+- `Upgrade: websocket`：转发握手；收到上游 `101` 后进入双向原始字节隧道；
+- `CONNECT host:port`：选中后端并 TCP 连通后，直接回 `200 Connection Established`，再双向隧道（反向代理语义：隧道目标是被选中的 backend，不是任意外网 host）。
+
+演示后端 `GET /api/ws` 完成最小 WebSocket 握手后做原始回显，便于验证隧道。
+
 ## 限制与下一步
 
 1. **请求体缓冲**：流式 h2 请求体需要把 h2 DATA、窗口更新、上游写水位联动。
 2. **单线程**：所有 stream 共享一个 epoll 事件循环；多 worker 需要重新设计 session 归属。
-3. **无 h2 上游**：上游仍是 h1；端到端 h2 需要新的连接池与流映射。
+3. **上游 h2 不复用连接池 / 无上游 TLS**：见上文。
 4. **无 push/trailer/优先级**：当前只覆盖普通请求/响应。
-5. **无 h2c**：明文 HTTP/2 需要 prior knowledge 或 Upgrade，当前只走 ALPN。
+5. **无 h2c 前端**：明文 HTTP/2 前端需要 prior knowledge 或 Upgrade，当前前端 h2 只走 ALPN。
 
 ## 相关源码
 
 - [`src/h2_impl.inc`](../src/h2_impl.inc)：H2Session、H2Stream、nghttp2 回调、data provider；
-- [`src/proxy.cpp`](../src/proxy.cpp)：`ClientConn::start_h2()`、`set_events()`、h2 事件委托；
+- [`src/proxy.cpp`](../src/proxy.cpp)：`UpstreamConn` h2 client、`ClientConn` 隧道、`start_h2()`；
 - [`src/tls.cpp`](../src/tls.cpp)：ALPN 与 TLS 传输；
-- [`tests/integration_test.py`](../tests/integration_test.py)：h2 场景；
+- [`apps/eg_h2echo.cpp`](../apps/eg_h2echo.cpp)：h2c 测试上游；
+- [`tests/integration_test.py`](../tests/integration_test.py)：h2 / 隧道场景；
 - [`scripts/h2_manual.sh`](../scripts/h2_manual.sh)：手工多路复用/上传/背压脚本。

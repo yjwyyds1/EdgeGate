@@ -15,12 +15,15 @@ struct BackendConfig {
     std::string url;
     std::size_t max_connections = 0;  // 0 = inherit global
     std::size_t max_idle = 0;         // 0 = inherit global
+    bool http2 = false;               // 上游使用 HTTP/2（h2c prior knowledge）
 };
 
 struct Config {
     Endpoint listen{"0.0.0.0", 8080};
     Endpoint admin{"127.0.0.1", 9900};
     bool admin_enabled = true;
+    int num_workers = 1;  // 1 = 单进程；>1 时 SO_REUSEPORT + fork
+    int worker_id = 0;    // 运行时：当前 worker 编号（0 .. num_workers-1）
 
     // TLS / HTTP2
     bool tls_enabled = false;

@@ -117,10 +117,12 @@ private:
 // 序列化。send_chunked 为 true 时使用 Transfer-Encoding: chunked。
 std::string build_request_head(const RequestHead& req, std::string_view upstream_authority,
                                std::string_view client_ip, std::string_view request_id,
-                               bool preserve_host, bool send_chunked);
+                               bool preserve_host, bool send_chunked,
+                               bool websocket_upgrade = false);
 std::string build_response_head(const ResponseHead& resp, std::string_view upstream_name,
                                 std::string_view request_id, bool client_http10,
-                                bool keep_client_alive, bool send_chunked);
+                                bool keep_client_alive, bool send_chunked,
+                                bool websocket_upgrade = false);
 std::string build_error_response(int status, std::string_view message,
                                  std::string_view request_id, bool keep_alive,
                                  bool client_http10 = false, bool head_only = false);
